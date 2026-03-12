@@ -21,13 +21,18 @@ chatForm.addEventListener('submit', async (e) => {
         const searchData = await searchLocation(query);
         removeLoading(loadingId);
 
-        // intent now includes: { location, metric, day_offset, target_date }
-        const intent = searchData.intent || { metric: 'ALL', day_offset: 0, target_date: todayIST() };
+        // intent now includes: { location, metric, query_type, day_offset, target_date, range_days, condition }
+        const intent = searchData.intent || {};
 
-        // Ensure defaults so downstream code never gets undefined
+        // Apply defaults — ALL fields must be safe to use downstream
         intent.metric      = intent.metric      || 'ALL';
+        intent.query_type  = intent.query_type  || 'single';
         intent.day_offset  = intent.day_offset  ?? 0;
         intent.target_date = intent.target_date || todayIST();
+        intent.range_days  = intent.range_days  || null;
+        intent.condition   = intent.condition   || null;
+
+        // Log the full intent so we can debug routing issues
 
         if (searchData.response && searchData.response.docs.length > 0) {
             const docs = searchData.response.docs;
@@ -59,14 +64,33 @@ async function searchLocation(query) {
 }
 
 async function fetchWeather(lat, lon, intent) {
-    // ✅ FIX: always forward target_date and day_offset so the backend filters correctly
-    const params = new URLSearchParams({
-        lat,
-        lon,
-        target_date: intent.target_date,
-        day_offset:  intent.day_offset,
-    });
-    console.log('[FETCH WEATHER]', params.toString());
+    const params = new URLSearchParams({ lat, lon });
+
+    const qt = intent.query_type || 'single';
+    params.set('query_type', qt);
+
+
+    if (qt === 'single') {
+        // Single day — must send target_date and day_offset
+        params.set('target_date', intent.target_date);
+        params.set('day_offset',  intent.day_offset ?? 0);
+
+    } else if (['range', 'range_few', 'range_week'].includes(qt)) {
+        // Range — send number of days
+        if (intent.range_days) params.set('range_days', intent.range_days);
+
+    } else if (qt === 'conditional_rain') {
+        // Always send target_date + day_offset so backend can resolve "tomorrow" etc.
+        params.set('target_date', intent.target_date);
+        params.set('day_offset',  intent.day_offset ?? 0);
+        // range_days=1 means "specific day", larger means "next N days window"
+        if (intent.range_days) params.set('range_days', intent.range_days);
+
+    } else if (qt === 'conditional_condition') {
+        if (intent.condition)  params.set('condition',  intent.condition);
+        if (intent.range_days) params.set('range_days', intent.range_days);
+    }
+
     const res = await fetch(`${API_BASE_URL}/weather/daily?${params}`);
     if (!res.ok) {
         const err = await res.json().catch(() => ({}));
@@ -89,7 +113,6 @@ async function handleLocationSelection(doc, intent) {
         return;
     }
 
-    console.log(`[LOCATION] Using coords: lat=${lat}, lon=${lon} | intent:`, intent);
 
     const loadingId = appendLoading();
 
@@ -102,18 +125,28 @@ async function handleLocationSelection(doc, intent) {
         const msgNote  = weatherData["_message"];        // set when past date requested
 
         if (msgNote) {
-            // Past date — backend told us there's no historical data
             appendMessage('bot', `ℹ️ ${msgNote}`);
             return;
         }
 
         if (records.length === 0) {
-            appendMessage('bot', `No forecast data found for ${intent.target_date}. The GFS model may not have data that far ahead yet.`);
+            appendMessage('bot', `No forecast data found for the requested period.`);
             return;
         }
 
-        // ✅ FIX: use records[0] — backend already filtered to the right date
-        displayWeatherCard(doc, records[0], intent);
+        // Route to correct display based on query type
+        const qt = intent.query_type || 'single';
+        if (qt === 'single') {
+            displayWeatherCard(doc, records[0], intent);
+        } else if (['range','range_few','range_week'].includes(qt)) {
+            displayMultiDayForecast(doc, records, intent);
+        } else if (qt === 'conditional_rain') {
+            displayRainyDays(doc, records, intent);
+        } else if (qt === 'conditional_condition') {
+            displayConditionDays(doc, records, intent);
+        } else {
+            displayWeatherCard(doc, records[0], intent);
+        }
 
     } catch (error) {
         console.error('[WEATHER ERROR]', error);
@@ -144,6 +177,137 @@ function handleMultipleLocations(docs, intent) {
     const msg = appendMessage('bot', '', true);
     msg.querySelector('.message-content').appendChild(content);
     msg.querySelector('.message-content').appendChild(chips);
+}
+
+// ─────────────────────────────────────────────
+// Multi-day / conditional display functions
+// ─────────────────────────────────────────────
+
+function displayMultiDayForecast(doc, records, intent) {
+    const locationName = buildLocationLabel(doc);
+    const n = records.length;
+    const metric = intent.metric;
+
+    const rows = records.map(r => {
+        const d     = new Date(r.Date_time);
+        const label = d.toLocaleDateString('en-IN', { weekday:'short', day:'numeric', month:'short' });
+        const cond  = weatherCondition(r);
+        const highlighted = (metric && metric !== 'ALL') ? `<strong>${metricMeta(metric).label}: ${formatVal(r[metric], metric)}${metricMeta(metric).unit}</strong>` : '';
+        return `
+            <tr>
+                <td>${label}</td>
+                <td>${Math.round(r.Tmax)}° / ${Math.round(r.Tmin)}°</td>
+                <td>${r.Rainfall.toFixed(1)} mm</td>
+                <td>${Math.round(r.RH)}%</td>
+                <td>${cond}</td>
+                ${highlighted ? `<td>${highlighted}</td>` : ''}
+            </tr>`;
+    }).join('');
+
+    const html = `
+        <div class="weather-card">
+            <div class="weather-header">
+                <div class="location-name">${locationName}</div>
+                <div class="date">${n}-Day Forecast</div>
+            </div>
+            <table class="forecast-table">
+                <thead>
+                    <tr>
+                        <th>Date</th><th>High / Low</th><th>Rain</th><th>Humidity</th><th>Condition</th>
+                        ${(metric && metric !== 'ALL') ? `<th>${metricMeta(metric).label}</th>` : ''}
+                    </tr>
+                </thead>
+                <tbody>${rows}</tbody>
+            </table>
+        </div>`;
+    appendMessage('bot', html, true);
+}
+
+function displayRainyDays(doc, records, intent) {
+    const locationName = buildLocationLabel(doc);
+    const isSingleDay  = intent.range_days === 1;
+
+    if (records.length === 0) {
+        // This path is hit from _message handling, but keep as fallback
+        appendMessage('bot', `☀️ No rainfall expected in ${locationName}.`);
+        return;
+    }
+
+    // Single-day rain check: "will it rain tomorrow in delhi?"
+    if (isSingleDay) {
+        const r         = records[0];
+        const d         = new Date(r.Date_time);
+        const dateLabel = formatDate(r.Date_time, intent);
+        const rainfall  = r.Rainfall ? r.Rainfall.toFixed(1) : '0.0';
+        const html = `
+            <div class="weather-card">
+                <div class="weather-header">
+                    <div class="location-name">${locationName}</div>
+                    <div class="date">${dateLabel}</div>
+                </div>
+                <div class="weather-main" style="padding:16px 20px;">
+                    <div style="font-size:2rem;margin-bottom:8px;">🌧️</div>
+                    <div style="font-size:1.1rem;font-weight:600;color:#2563eb;margin-bottom:4px;">
+                        Yes — rainfall expected
+                    </div>
+                    <div style="font-size:0.95rem;color:#555;">
+                        Estimated rainfall: <strong>${rainfall} mm</strong> &nbsp;|&nbsp; Humidity: <strong>${Math.round(r.RH)}%</strong>
+                    </div>
+                </div>
+            </div>`;
+        appendMessage('bot', html, true);
+        return;
+    }
+
+    // Multi-day: show table of all rainy days
+    const rows = records.map(r => {
+        const label = new Date(r.Date_time).toLocaleDateString('en-IN', { weekday:'long', day:'numeric', month:'short' });
+        return `<tr><td>${label}</td><td>${r.Rainfall.toFixed(1)} mm</td><td>${Math.round(r.RH)}%</td><td>${weatherCondition(r)}</td></tr>`;
+    }).join('');
+
+    const windowDesc = intent.range_days ? `Next ${intent.range_days} Days` : 'Forecast Period';
+    const html = `
+        <div class="weather-card">
+            <div class="weather-header">
+                <div class="location-name">${locationName}</div>
+                <div class="date">🌧 Rainy Days — ${windowDesc}</div>
+            </div>
+            <p style="padding:8px 12px;color:#555;">Found <strong>${records.length}</strong> day(s) with expected rainfall:</p>
+            <table class="forecast-table">
+                <thead><tr><th>Date</th><th>Rainfall</th><th>Humidity</th><th>Condition</th></tr></thead>
+                <tbody>${rows}</tbody>
+            </table>
+        </div>`;
+    appendMessage('bot', html, true);
+}
+
+function displayConditionDays(doc, records, intent) {
+    const locationName = buildLocationLabel(doc);
+    const cond = intent.condition || 'matching';
+
+    if (records.length === 0) {
+        appendMessage('bot', `No '${cond}' weather expected in ${locationName} in the coming days.`);
+        return;
+    }
+
+    const rows = records.map(r => {
+        const d     = new Date(r.Date_time);
+        const label = d.toLocaleDateString('en-IN', { weekday:'long', day:'numeric', month:'short' });
+        return `<tr><td>${label}</td><td>${Math.round(r.Tmax)}° / ${Math.round(r.Tmin)}°</td><td>${r.Wind_Speed.toFixed(1)} km/h</td><td>${Math.round(r.RH)}%</td></tr>`;
+    }).join('');
+
+    const html = `
+        <div class="weather-card">
+            <div class="weather-header">
+                <div class="location-name">${locationName}</div>
+                <div class="date">Days with '${cond}' conditions</div>
+            </div>
+            <table class="forecast-table">
+                <thead><tr><th>Date</th><th>High / Low</th><th>Wind</th><th>Humidity</th></tr></thead>
+                <tbody>${rows}</tbody>
+            </table>
+        </div>`;
+    appendMessage('bot', html, true);
 }
 
 // ─────────────────────────────────────────────

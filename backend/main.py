@@ -3,20 +3,9 @@ from fastapi.middleware.cors import CORSMiddleware
 import httpx
 import os
 import re
-import logging
 import time as time_module
 from datetime import date, datetime, timezone
 from typing import Optional, Dict
-
-# ──────────────────────────────────────────────
-# Logging setup — outputs to console with timestamps
-# ──────────────────────────────────────────────
-logging.basicConfig(
-    level=logging.DEBUG,
-    format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
-logger = logging.getLogger("weathersnap")
 
 app = FastAPI(title="WeatherSnap ChatBot Backend")
 
@@ -38,16 +27,12 @@ ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*").split(",")
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
     start = time_module.time()
-    logger.info(f"➡️  REQUEST  {request.method} {request.url}")
-    logger.debug(f"   Headers : {dict(request.headers)}")
     try:
         response = await call_next(request)
         duration = round((time_module.time() - start) * 1000, 1)
-        logger.info(f"⬅️  RESPONSE {response.status_code} — {duration}ms")
         return response
     except Exception as exc:
         duration = round((time_module.time() - start) * 1000, 1)
-        logger.error(f"💥 UNHANDLED EXCEPTION after {duration}ms: {exc}", exc_info=True)
         raise
 
 # ──────────────────────────────────────────────
@@ -55,7 +40,7 @@ async def log_requests(request: Request, call_next):
 # ──────────────────────────────────────────────
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,   # set ALLOWED_ORIGINS=https://wsnap.niruthiapptesting.com in prod
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -83,8 +68,6 @@ TIME_WORDS = {
     "jul", "aug", "sep", "oct", "nov", "dec",
 }
 
-# Maps time phrases → day offset relative to today (0=today, 1=tomorrow, -1=yesterday, etc.)
-# Ordered longest-first so "day after tomorrow" matches before "tomorrow"
 TIME_INTENT_MAP = [
     ("day after tomorrow",  2),
     ("day before yesterday",-2),
@@ -96,7 +79,7 @@ TIME_INTENT_MAP = [
     ("now",                 0),
     ("currently",           0),
     ("this week",           0),
-    ("next monday",         None),   # weekday — resolved dynamically below
+    ("next monday",         None), 
     ("next tuesday",        None),
     ("next wednesday",      None),
     ("next thursday",       None),
@@ -114,6 +97,16 @@ TIME_INTENT_MAP = [
 
 WEEKDAY_NAMES = ["monday","tuesday","wednesday","thursday","friday","saturday","sunday"]
 
+MULTI_DAY_PATTERNS = [
+    (re.compile(r"(?:next|coming|in(?:\s+the)?)\s+(\d+)\s+days?"), "range"),
+    (re.compile(r"(?:next|coming)\s+(?:few|couple\s+of|some)\s+days?"),  "range_few"),
+    (re.compile(r"(?:this|next|coming)\s+week"),                          "range_week"),
+    (re.compile(r"\bwhen\s+(?:will|does|is|would)\s+it\s+rain\b"),       "conditional_rain"),
+    (re.compile(r"\bwhen\s+(?:will|is|does)\s+(?:there\s+be\s+)?rain\b"),"conditional_rain"),
+    (re.compile(r"\bwill\s+it\s+rain\b"),                                 "conditional_rain"),
+    (re.compile(r"\bwhen\s+will\s+it\s+be\s+(hot|cold|windy|humid|warm)\b"), "conditional_condition"),
+]
+
 def resolve_day_offset(phrase: str) -> int:
     """Convert a weekday name to a day offset from today."""
     from datetime import timedelta
@@ -122,10 +115,9 @@ def resolve_day_offset(phrase: str) -> int:
     today_idx   = datetime.now(timezone.utc).weekday()
     delta = (target_idx - today_idx) % 7
     if delta == 0:
-        delta = 7   # "next monday" when today is monday → 7 days ahead
+        delta = 7   
     return delta
 
-# Ordered from most-specific to least-specific so longer phrases match first
 METRIC_MAP = {
     "maximum temperature": "Tmax",
     "max temperature":     "Tmax",
@@ -141,14 +133,14 @@ METRIC_MAP = {
     "rainfall":            "Rainfall",
     "rain":                "Rainfall",
     "humidity":            "RH",
-    "temperature":         "Tavg",   # generic "temperature" → average
+    "humid":               "RH",
+    "temperature":         "Tavg",  
     "temp":                "Tavg",
 }
 
-# All words that appear in metric phrases (to help strip them from location)
 METRIC_WORDS = {
     "max", "min", "maximum", "minimum", "average", "avg",
-    "temperature", "temp", "rain", "rainfall", "humidity",
+    "temperature", "temp", "rain", "rainfall", "humidity", "humid",
     "wind", "speed",
 }
 
@@ -156,51 +148,85 @@ METRIC_WORDS = {
 def extract_intent(query: str) -> Dict:
     """
     Parse a free-text weather query and return:
-      - location   : cleaned place name
-      - metric     : one of the METRIC_MAP values, or "ALL" if unspecified
-      - day_offset : int — 0=today, 1=tomorrow, -1=yesterday, etc. (default 0)
-      - target_date: ISO date string for the requested day (e.g. '2026-03-13')
+      - location    : cleaned place name
+      - metric      : one of the METRIC_MAP values, or "ALL"
+      - query_type  : "single" | "range" | "conditional_rain" | "conditional_condition"
+      - day_offset  : int (single-day queries only)
+      - target_date : ISO string (single-day queries only)
+      - range_days  : int (range queries — how many days to return)
+      - condition   : str (conditional queries — what to look for, e.g. "rain", "hot")
     """
-    logger.debug(f"[NLU] Raw query: '{query}'")
     q = query.lower().strip()
 
-    # ── 1. Extract metric (longest-match first) ──────────────────────────────
-    metric = None
-    for phrase, value in METRIC_MAP.items():
-        if phrase in q:
-            metric = value
-            logger.debug(f"[NLU] Metric matched: '{phrase}' → '{value}'")
-            break
-    if metric is None:
-        logger.debug("[NLU] No metric keyword found — will default to 'ALL'")
-
-    # ── 2. Extract time intent ────────────────────────────────────────────────
     from datetime import timedelta
     ist_offset = timedelta(hours=5, minutes=30)
     today_ist  = (datetime.now(timezone.utc) + ist_offset).date()
 
+    # ── 1. Extract metric ────────────────────────────────────────────────────
+    metric = None
+    for phrase, value in METRIC_MAP.items():
+        if phrase in q:
+            metric = value
+            break
+
+
+    # ── 2. Check for multi-day / conditional patterns FIRST ─────────────────
+    query_type = "single"
+    range_days = None
+    condition  = None
+
+    for pattern, ptype in MULTI_DAY_PATTERNS:
+        m = pattern.search(q)
+        if m:
+            query_type = ptype
+
+            if ptype == "range":
+                range_days = int(m.group(1))
+
+            elif ptype == "range_few":
+                range_days = 5   # "few days" → 5
+
+            elif ptype == "range_week":
+                range_days = 7
+
+            elif ptype == "conditional_rain":
+                query_type = "conditional_rain"
+                condition  = "rain"
+                metric     = "Rainfall"   # override metric to Rainfall
+
+            elif ptype == "conditional_condition":
+                query_type = "conditional_condition"
+                condition  = m.group(1)   # "hot", "cold", "windy", "humid", "warm"
+
+            break
+
+
     day_offset  = 0
-    time_phrase = "today"
+    target_date = today_ist
+
     for phrase, offset in TIME_INTENT_MAP:
         if phrase in q:
             if offset is None:
                 day_offset = resolve_day_offset(phrase)
             else:
                 day_offset = offset
-            time_phrase = phrase
-            logger.debug(f"[NLU] Time intent matched: '{phrase}' → day_offset={day_offset}")
             break
-    else:
-        logger.debug("[NLU] No time phrase found — defaulting to today (day_offset=0)")
 
     target_date = today_ist + timedelta(days=day_offset)
-    logger.debug(f"[NLU] Target date: {target_date} (offset={day_offset:+d} from today {today_ist})")
 
-    # ── 3. Extract location ───────────────────────────────────────────────────
+    SPECIFIC_DAY_WORDS = {"tomorrow", "tonight", "today", "now", "yesterday",
+                          "monday","tuesday","wednesday","thursday","friday","saturday","sunday",
+                          "day after tomorrow"}
+    has_specific_day = any(word in q for word in SPECIFIC_DAY_WORDS)
+
+    if query_type == "conditional_rain" and has_specific_day and not range_days:
+        range_days = 1
+
+    # ── 4. Extract location ──────────────────────────────────────────────────
     location = q
 
     preposition_patterns = [
-        r"\bin\s+([a-z][a-z\s]+?)(?:\s+(?:today|tomorrow|tonight|yesterday|next|this|now|currently|day\s+after|day\s+before)|\?|$)",
+        r"\bin\s+([a-z][a-z\s]+?)(?:\s+(?:today|tomorrow|tonight|yesterday|next|this|now|currently|in\s+next|day\s+after|day\s+before|when)|\?|$)",
         r"\bat\s+([a-z][a-z\s]+?)(?:\s+(?:today|tomorrow|tonight|yesterday|next|this|now|currently)|\?|$)",
         r"\bfor\s+([a-z][a-z\s]+?)(?:\s+(?:today|tomorrow|tonight|yesterday|next|this|now|currently)|\?|$)",
         r"\bof\s+([a-z][a-z\s]+?)(?:\s+(?:today|tomorrow|tonight|yesterday|next|this|now|currently)|\?|$)",
@@ -210,61 +236,45 @@ def extract_intent(query: str) -> Dict:
         m = re.search(pattern, q)
         if m:
             location = m.group(1).strip()
-            logger.debug(f"[NLU] Location via preposition regex: '{location}'")
             matched = True
             break
 
     if not matched:
-        logger.debug("[NLU] No preposition pattern matched — falling back to stop-word stripping")
         combined_stop = LOCATION_STOP_WORDS | METRIC_WORDS | TIME_WORDS
         words = q.split()
         location_words = [w for w in words if w not in combined_stop]
-        logger.debug(f"[NLU] Words after stop-word removal: {location_words}")
         location = " ".join(location_words).strip()
 
-    before_time_strip = location
     location_tokens = [w for w in location.split() if w not in TIME_WORDS]
-    location = " ".join(location_tokens).strip()
-    if before_time_strip != location:
-        logger.debug(f"[NLU] Time words stripped: '{before_time_strip}' → '{location}'")
-
-    before_punct = location
-    location = re.sub(r"[^\w\s]", "", location).strip()
-    if before_punct != location:
-        logger.debug(f"[NLU] Punctuation stripped: '{before_punct}' → '{location}'")
+    location = re.sub(r"[^\w\s]", "", " ".join(location_tokens)).strip()
 
     final_location = location or query.strip()
     final_metric   = metric or "ALL"
 
-    if not location:
-        logger.warning(f"[NLU] Location extraction empty — using raw query: '{query.strip()}'")
-
-    logger.info(f"[NLU] Intent → location='{final_location}', metric='{final_metric}', day_offset={day_offset:+d}, target_date={target_date}")
     return {
         "location":    final_location,
         "metric":      final_metric,
+        "query_type":  query_type,
         "day_offset":  day_offset,
         "target_date": str(target_date),
+        "range_days":  range_days,
+        "condition":   condition,
     }
 
 
 def validate_location(location: str) -> None:
     """Raise 400 if the extracted location is clearly invalid."""
-    logger.debug(f"[VALIDATE] Checking location: '{location}'")
     if not location or len(location) < 2:
-        logger.warning(f"[VALIDATE] ❌ Location too short or empty: '{location}'")
         raise HTTPException(
             status_code=400,
             detail="Could not extract a valid location from your query. "
                    "Try: 'weather in Mumbai' or 'rainfall in Delhi'.",
         )
     if re.fullmatch(r"[\W\d\s]+", location):
-        logger.warning(f"[VALIDATE] ❌ Location looks invalid (no letters): '{location}'")
         raise HTTPException(
             status_code=400,
             detail=f"Extracted location '{location}' looks invalid. Please be more specific.",
         )
-    logger.debug(f"[VALIDATE] ✅ Location '{location}' passed validation")
 
 
 # ──────────────────────────────────────────────
@@ -279,26 +289,17 @@ CACHE_TTL_SECONDS = 300   # 5 minutes
 def cache_get(key: str) -> Optional[Any]:
     entry = _cache.get(key)
     if entry and (time_module.time() - entry[1]) < CACHE_TTL_SECONDS:
-        logger.debug(f"[CACHE] ✅ HIT  — key='{key}'")
         return entry[0]
-    if entry:
-        logger.debug(f"[CACHE] ⏰ EXPIRED — key='{key}'")
-    else:
-        logger.debug(f"[CACHE] ❌ MISS  — key='{key}'")
     return None
 
 
 def cache_set(key: str, value: Any) -> None:
     _cache[key] = (value, time_module.time())
-    logger.debug(f"[CACHE] 💾 SET   — key='{key}'")
 
 
 # ──────────────────────────────────────────────
 # Coordinate resolver
 # ──────────────────────────────────────────────
-
-# All known lat/lon field name patterns in Solr docs, ordered most-precise first.
-# The website uses the most precise available coordinate — we must do the same.
 COORD_FIELD_PRIORITY = [
     ("village_latitude",       "village_longitude"),
     ("village_lat",            "village_lon"),
@@ -326,10 +327,8 @@ def resolve_best_coords(doc: dict):
             lat = lat[0] if isinstance(lat, list) else lat
             lon = lon[0] if isinstance(lon, list) else lon
             if lat and lon:
-                logger.debug(f"[COORDS] Resolved via '{lat_field}': lat={lat}, lon={lon}")
                 return lat, lon
 
-    logger.warning(f"[COORDS] ⚠️ No coordinate fields found in doc: {list(doc.keys())}")
     return None, None
 
 
@@ -343,7 +342,6 @@ async def search_location(q: str = Query(..., min_length=2)):
     Accepts a natural-language query, extracts location + metric intent,
     and searches Solr for matching locations.
     """
-    logger.info(f"[SEARCH] Received query: '{q}'")
     intent = extract_intent(q)
     extracted_q = intent["location"]
 
@@ -353,7 +351,6 @@ async def search_location(q: str = Query(..., min_length=2)):
     cached = cache_get(cache_key)
     if cached:
         cached["intent"] = intent
-        logger.info(f"[SEARCH] Returning cached result for location='{extracted_q}'")
         return cached
 
     solr_q = (
@@ -363,31 +360,23 @@ async def search_location(q: str = Query(..., min_length=2)):
     params = {"q": solr_q, "rows": 8, "wt": "json"}
     headers = {"Authorization": SOLR_AUTH}
 
-    logger.debug(f"[SEARCH] Solr URL  : {SOLR_SEARCH_URL}")
-    logger.debug(f"[SEARCH] Solr query: {solr_q}")
 
     async with httpx.AsyncClient(timeout=10.0) as client:
         try:
             response = await client.get(SOLR_SEARCH_URL, params=params, headers=headers)
-            logger.debug(f"[SEARCH] Solr HTTP status: {response.status_code}")
-            logger.debug(f"[SEARCH] Solr raw response: {response.text[:500]}")
             response.raise_for_status()
             data = response.json()
 
             num_results = data.get("response", {}).get("numFound", "?")
-            logger.info(f"[SEARCH] Solr returned {num_results} result(s) for '{extracted_q}'")
 
             # ── Log ALL fields of first doc so we can see every coord field available ──
             if data.get("response", {}).get("docs"):
                 first_doc = data["response"]["docs"][0]
-                logger.debug(f"[SEARCH] First doc ALL fields: {first_doc}")
                 coord_fields = {k: v for k, v in first_doc.items() if 'lat' in k.lower() or 'lon' in k.lower() or 'long' in k.lower()}
-                logger.info(f"[SEARCH] First doc coordinate fields: {coord_fields}")
 
                 # ── Inject best_coords into each doc so frontend always uses right lat/lon ──
                 for doc in data["response"]["docs"]:
                     doc["_best_lat"], doc["_best_lon"] = resolve_best_coords(doc)
-                    logger.debug(f"[SEARCH] Doc '{doc.get('village', doc.get('district', ['?']))[0]}' → best_lat={doc['_best_lat']}, best_lon={doc['_best_lon']}")
 
             if "response" in data:
                 data["intent"] = intent
@@ -396,13 +385,10 @@ async def search_location(q: str = Query(..., min_length=2)):
             return data
 
         except httpx.TimeoutException:
-            logger.error(f"[SEARCH] ⏱ Solr request timed out for query='{extracted_q}'")
             raise HTTPException(status_code=504, detail="Location search timed out. Please try again.")
         except httpx.HTTPStatusError as exc:
-            logger.error(f"[SEARCH] ❌ Solr HTTP error {exc.response.status_code}: {exc.response.text[:300]}")
             raise HTTPException(status_code=exc.response.status_code, detail=f"Search API error: {exc}")
         except Exception as exc:
-            logger.error(f"[SEARCH] 💥 Unexpected error: {exc}", exc_info=True)
             raise HTTPException(status_code=500, detail=f"Internal server error: {exc}")
 
 
@@ -447,10 +433,8 @@ def filter_by_date(records: list, target_date, day_offset: int, date_field: str 
         from datetime import date
         target_date = date.fromisoformat(target_date)
 
-    logger.debug(f"[DATE-FILTER] Filtering for target_date={target_date}, day_offset={day_offset:+d}")
 
     if day_offset < 0:
-        logger.warning(f"[DATE-FILTER] ⚠️  User asked for past date ({target_date}) — GFS has no historical data, returning empty")
         return []
 
     matched, available = [], []
@@ -462,13 +446,7 @@ def filter_by_date(records: list, target_date, day_offset: int, date_field: str 
             if record_date == target_date:
                 matched.append(record)
         except (ValueError, TypeError):
-            logger.warning(f"[DATE-FILTER] Could not parse date '{raw}' — skipping record")
-
-    logger.debug(f"[DATE-FILTER] Available dates in GFS response: {sorted(set(available))}")
-    logger.info(f"[DATE-FILTER] Matched {len(matched)} record(s) for target date {target_date}")
-
-    if not matched:
-        logger.warning(f"[DATE-FILTER] ⚠️  No records found for {target_date}. Available: {sorted(set(available))}")
+            pass
 
     return matched
 
@@ -478,7 +456,6 @@ def filter_from_today(records: list, date_field: str = "Date_time") -> list:
     from datetime import timedelta
     ist_offset  = timedelta(hours=5, minutes=30)
     today_ist   = (datetime.now(timezone.utc) + ist_offset).date()
-    logger.debug(f"[DATE-FILTER] Filtering from today ({today_ist}) onwards")
 
     filtered, skipped = [], []
     for record in records:
@@ -490,113 +467,131 @@ def filter_from_today(records: list, date_field: str = "Date_time") -> list:
             else:
                 skipped.append(str(record_date))
         except (ValueError, TypeError):
-            logger.warning(f"[DATE-FILTER] Could not parse date '{raw}' — keeping record")
             filtered.append(record)
 
-    if skipped:
-        logger.info(f"[DATE-FILTER] Dropped {len(skipped)} stale record(s): {skipped}")
-    logger.info(f"[DATE-FILTER] Kept {len(filtered)} record(s) from today onwards")
     return filtered
 
 
 @app.get("/api/weather/daily")
 async def get_daily_weather(
-    lat: float,
-    lon: float,
-    days: Optional[int]  = Query(default=None, ge=1, le=16,  description="Return N days from today (ignored if target_date is set)"),
-    target_date: Optional[str] = Query(default=None, description="ISO date YYYY-MM-DD — return only this specific day"),
-    day_offset: Optional[int]  = Query(default=None, description="Day offset from today: 0=today, 1=tomorrow, -1=yesterday"),
+    lat:         float,
+    lon:         float,
+    days:        Optional[int] = Query(default=None, ge=1, le=16),
+    target_date: Optional[str] = Query(default=None),
+    day_offset:  Optional[int] = Query(default=None),
+    query_type:  Optional[str] = Query(default="single"),
+    range_days:  Optional[int] = Query(default=None, ge=1, le=16),
+    condition:   Optional[str] = Query(default=None),
 ):
     """
-    Fetch daily weather forecast.
-    Priority: target_date > day_offset > days > all-from-today
+    query_type=single            -> one specific day
+    query_type=range             -> range_days days from today
+    query_type=conditional_rain  -> days where Rainfall > 0
+    query_type=conditional_condition -> days matching hot/cold/windy/humid
     """
-    logger.info(f"[DAILY] Request — lat={lat}, lon={lon}, days={days}, target_date={target_date}, day_offset={day_offset}")
-
-    cache_key = f"daily:{lat}:{lon}:{target_date}:{day_offset}:{days}"
+    cache_key = f"daily:{lat}:{lon}:{query_type}:{target_date}:{day_offset}:{days}:{range_days}:{condition}"
     cached = cache_get(cache_key)
     if cached:
-        logger.info(f"[DAILY] Returning cached result")
         return cached
 
-    # Resolve target_date from day_offset if not explicitly provided
-    from datetime import timedelta, date as date_type
-    ist_offset = timedelta(hours=5, minutes=30)
-    today_ist  = (datetime.now(timezone.utc) + ist_offset).date()
-
+    from datetime import timedelta, date as date_cls
+    ist_offset    = timedelta(hours=5, minutes=30)
+    today_ist     = (datetime.now(timezone.utc) + ist_offset).date()
     resolved_date = None
     resolved_offset = None
 
     if target_date:
         try:
-            from datetime import date
-            resolved_date   = date.fromisoformat(target_date)
+            resolved_date   = date_cls.fromisoformat(target_date)
             resolved_offset = (resolved_date - today_ist).days
-            logger.debug(f"[DAILY] Using explicit target_date={resolved_date} (offset={resolved_offset:+d})")
         except ValueError:
-            logger.error(f"[DAILY] Invalid target_date format: '{target_date}'")
-            raise HTTPException(status_code=400, detail=f"Invalid date format '{target_date}'. Use YYYY-MM-DD.")
+            raise HTTPException(status_code=400, detail=f"Invalid date '{target_date}'. Use YYYY-MM-DD.")
     elif day_offset is not None:
         resolved_offset = day_offset
         resolved_date   = today_ist + timedelta(days=day_offset)
-        logger.debug(f"[DAILY] Resolved day_offset={day_offset} → date={resolved_date}")
-
-    params = {"lat": lat, "lon": lon}
-    logger.debug(f"[DAILY] Calling GFS: {GFS_INTERPOLATE_URL} params={params}")
 
     async with httpx.AsyncClient(timeout=15.0) as client:
         try:
-            response = await client.get(GFS_INTERPOLATE_URL, params=params)
-            logger.debug(f"[DAILY] GFS status={response.status_code}")
-            logger.debug(f"[DAILY] GFS response preview: {response.text[:500]}")
+            response = await client.get(GFS_INTERPOLATE_URL, params={"lat": lat, "lon": lon})
             response.raise_for_status()
             data = response.json()
 
-            logger.info(f"[DAILY] GFS keys={list(data.keys()) if isinstance(data, dict) else type(data).__name__}")
+            def apply_filter(records: list):
+                """Returns (filtered_records, message_or_None)"""
 
-            def apply_filter(records: list) -> list:
+                # Range: next N days
+                if query_type in ("range", "range_few", "range_week"):
+                    n      = range_days or days or 7
+                    result = filter_from_today(records)[:n]
+                    return result, None
+
+                # Conditional: when will it rain
+                if query_type == "conditional_rain":
+                    future = filter_from_today(records)
+
+                    if range_days == 1 and resolved_date is not None:
+                        future = [r for r in future
+                                  if datetime.fromisoformat(r.get("Date_time","")).date() == resolved_date]
+                    elif range_days:
+                        future = future[:range_days]
+
+                    rainy_days = [r for r in future if (r.get("Rainfall") or 0) > 0]
+                    if not rainy_days:
+                        if range_days == 1 and resolved_date:
+                            return [], f"☀️ No rainfall expected in the forecast for {resolved_date.strftime('%A, %d %b')}."
+                        window_desc = f"next {range_days} days" if range_days else "forecast period"
+                        return [], f"☀️ No rainfall expected in the {window_desc}."
+                    return rainy_days, None
+
+                # Conditional: hot/cold/windy/humid
+                if query_type == "conditional_condition":
+                    future = filter_from_today(records)
+                    COND = {
+                        "hot":   lambda r: r.get("Tmax", 0) > 38,
+                        "warm":  lambda r: r.get("Tmax", 0) > 30,
+                        "cold":  lambda r: r.get("Tmin", 99) < 15,
+                        "windy": lambda r: r.get("Wind_Speed", 0) > 20,
+                        "humid": lambda r: r.get("RH", 0) > 80,
+                    }
+                    fn      = COND.get(condition or "", lambda r: True)
+                    matched = [r for r in future if fn(r)]
+                    if not matched:
+                        return [], f"No '{condition}' conditions expected in the forecast period."
+                    return matched, None
+
+                # Single day
                 if resolved_date is not None:
-                    # Specific day requested
+                    if resolved_offset < 0:
+                        return [], f"No historical data for {resolved_date}. GFS only provides forecasts from today onwards."
                     result = filter_by_date(records, resolved_date, resolved_offset)
-                    if not result and resolved_offset < 0:
-                        # Past date — return helpful message instead of empty list
-                        logger.warning("[DAILY] Past date requested — GFS has no historical data")
-                    return result
-                else:
-                    # No specific day — return from today onwards, optionally sliced
-                    result = filter_from_today(records)
-                    if days:
-                        result = result[:days]
-                        logger.debug(f"[DAILY] Sliced to {days} days")
-                    return result
+                    return result, None
 
+                # Default: all from today
+                result = filter_from_today(records)
+                if days:
+                    result = result[:days]
+                return result, None
+
+            extra_msg = None
             if isinstance(data, dict):
-                forecast_key = next((k for k in data if isinstance(data[k], list)), None)
-                if forecast_key:
-                    logger.debug(f"[DAILY] Forecast key='{forecast_key}', {len(data[forecast_key])} raw records")
-                    data[forecast_key] = apply_filter(data[forecast_key])
-                else:
-                    logger.warning("[DAILY] No list found in GFS dict — returning as-is")
+                fkey = next((k for k in data if isinstance(data[k], list)), None)
+                if fkey:
+                    data[fkey], extra_msg = apply_filter(data[fkey])
             elif isinstance(data, list):
-                data = apply_filter(data)
+                filtered, extra_msg = apply_filter(data)
+                data = {"Forecast data": filtered}
 
-            # Add a user-friendly message when past date is requested
-            if resolved_offset is not None and resolved_offset < 0:
-                if isinstance(data, dict):
-                    data["_message"] = f"No historical data available for {resolved_date}. GFS only provides forecasts from today onwards."
-                    logger.info("[DAILY] Injected past-date warning into response")
+            if extra_msg:
+                data["_message"] = extra_msg
 
             cache_set(cache_key, data)
             return data
 
         except httpx.TimeoutException:
-            logger.error(f"[DAILY] ⏱ Timeout for lat={lat}, lon={lon}")
             raise HTTPException(status_code=504, detail="Daily weather fetch timed out.")
         except httpx.HTTPStatusError as exc:
-            logger.error(f"[DAILY] ❌ HTTP {exc.response.status_code}: {exc.response.text[:300]}")
-            raise HTTPException(status_code=exc.response.status_code, detail=f"Interpolate API error: {exc}")
+            raise HTTPException(status_code=exc.response.status_code, detail=f"GFS API error: {exc}")
         except Exception as exc:
-            logger.error(f"[DAILY] 💥 {exc}", exc_info=True)
             raise HTTPException(status_code=500, detail=f"Internal server error: {exc}")
 
 
@@ -611,31 +606,22 @@ async def get_hourly_weather(
     - Strips records before the current hour (IST).
     - Returns only the first `hours` entries (default 24).
     """
-    logger.info(f"[HOURLY] Request — lat={lat}, lon={lon}, hours={hours}")
-
     cache_key = f"hourly:{lat}:{lon}:{hours}"
     cached = cache_get(cache_key)
     if cached:
-        logger.info(f"[HOURLY] Returning cached result for lat={lat}, lon={lon}")
         return cached
 
     params = {"lat": lat, "lon": lon}
-    logger.debug(f"[HOURLY] Calling GFS hourly URL: {GFS_HOURLY_URL} with params={params}")
 
     async with httpx.AsyncClient(timeout=15.0) as client:
         try:
             response = await client.get(GFS_HOURLY_URL, params=params)
-            logger.debug(f"[HOURLY] GFS HTTP status: {response.status_code}")
-            logger.debug(f"[HOURLY] GFS raw response (first 500 chars): {response.text[:500]}")
             response.raise_for_status()
             data = response.json()
-
-            logger.info(f"[HOURLY] GFS returned data type={type(data).__name__}, keys={list(data.keys()) if isinstance(data, dict) else 'N/A'}")
 
             from datetime import timedelta
             ist_offset = timedelta(hours=5, minutes=30)
             now_ist = datetime.now(timezone.utc) + ist_offset
-            logger.debug(f"[HOURLY] Current time (IST): {now_ist.strftime('%Y-%m-%d %H:%M')}")
 
             def filter_hourly(records: list) -> list:
                 filtered, skipped = [], []
@@ -648,35 +634,24 @@ async def get_hourly_weather(
                         else:
                             skipped.append(raw)
                     except (ValueError, TypeError):
-                        logger.warning(f"[HOURLY] Could not parse datetime '{raw}' — keeping record")
                         filtered.append(r)
-                if skipped:
-                    logger.info(f"[HOURLY] Dropped {len(skipped)} past hour record(s)")
                 return filtered
 
             if isinstance(data, dict):
                 forecast_key = next((k for k in data if isinstance(data[k], list)), None)
                 if forecast_key:
-                    logger.debug(f"[HOURLY] Found hourly list under key='{forecast_key}' with {len(data[forecast_key])} records")
                     data[forecast_key] = filter_hourly(data[forecast_key])[:hours]
-                    logger.debug(f"[HOURLY] After filter+slice: {len(data[forecast_key])} records")
-                else:
-                    logger.warning("[HOURLY] No list found inside GFS dict response — returning as-is")
             elif isinstance(data, list):
                 data = filter_hourly(data)[:hours]
-                logger.debug(f"[HOURLY] After filter+slice: {len(data)} records")
 
             cache_set(cache_key, data)
             return data
 
         except httpx.TimeoutException:
-            logger.error(f"[HOURLY] ⏱ GFS request timed out for lat={lat}, lon={lon}")
             raise HTTPException(status_code=504, detail="Hourly weather fetch timed out.")
         except httpx.HTTPStatusError as exc:
-            logger.error(f"[HOURLY] ❌ GFS HTTP error {exc.response.status_code}: {exc.response.text[:300]}")
             raise HTTPException(status_code=exc.response.status_code, detail=f"Hourly API error: {exc}")
         except Exception as exc:
-            logger.error(f"[HOURLY] 💥 Unexpected error: {exc}", exc_info=True)
             raise HTTPException(status_code=500, detail=f"Internal server error: {exc}")
 
 
@@ -685,7 +660,6 @@ async def get_hourly_weather(
 # ──────────────────────────────────────────────
 @app.get("/health")
 async def health():
-    logger.debug("[HEALTH] Health check called")
     return {"status": "ok"}
 
 
