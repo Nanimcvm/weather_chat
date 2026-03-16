@@ -2,3 +2,6 @@ fastapi
 uvicorn
 httpx
 python-dotenv
+groq
+langsmith
+dateparser

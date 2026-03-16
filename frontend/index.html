@@ -1,48 +1,223 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>WeatherSnap ChatBot</title>
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="style.css">
-    <meta name="description" content="A premium weather chatbot providing real-time weather updates and forecasts.">
+    <meta charset="utf-8"/>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+    <title>NiruthiBot — Farm Intelligence</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Public+Sans:wght@400;500;600;700&display=swap" rel="stylesheet"/>
+    <link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@400,0..1&display=swap" rel="stylesheet"/>
+    <script>
+        tailwind.config = {
+            theme: { extend: { colors: { primary: "#2e7d32", "primary-dark": "#1b5e20" } } }
+        }
+    </script>
+    <style>
+        * { box-sizing: border-box; }
+        body { font-family: 'Public Sans', sans-serif; background: #f0f7f1; }
+
+        .material-symbols-outlined {
+            font-variation-settings: 'FILL' 0, 'wght' 400, 'GRAD' 0, 'opsz' 24;
+            vertical-align: middle; user-select: none; line-height: 1;
+        }
+        .fill-1 { font-variation-settings: 'FILL' 1, 'wght' 400, 'GRAD' 0, 'opsz' 24; }
+
+        /* Scrollbar */
+        #chat-scroll::-webkit-scrollbar { width: 4px; }
+        #chat-scroll::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 99px; }
+
+        /* Textarea */
+        #user-input {
+            resize: none; outline: none; border: none; background: transparent;
+            font-family: inherit; font-size: 0.9375rem; color: #1e293b;
+            width: 100%; cursor: text; line-height: 1.6;
+            padding: 0.8125rem 1rem; max-height: 140px; overflow-y: auto;
+        }
+        #user-input::placeholder { color: #94a3b8; }
+
+        /* Send button */
+        #send-btn {
+            background: #2e7d32; color: white; border: none; border-radius: 0.75rem;
+            padding: 0.625rem; cursor: pointer; flex-shrink: 0;
+            display: flex; align-items: center; justify-content: center;
+            box-shadow: 0 2px 10px rgba(46,125,50,0.4);
+            transition: background 120ms, transform 120ms, box-shadow 120ms;
+            align-self: flex-end; margin-bottom: 0;
+        }
+        #send-btn:hover  { background: #1b5e20; transform: translateY(-1px); box-shadow: 0 4px 16px rgba(46,125,50,0.45); }
+        #send-btn:active { transform: scale(0.93); box-shadow: 0 1px 4px rgba(46,125,50,0.25); }
+
+        /* Clear button */
+        .btn-clear {
+            display: inline-flex; align-items: center; gap: 0.375rem;
+            font-size: 0.75rem; font-weight: 500; color: #64748b;
+            padding: 0.375rem 0.75rem; border-radius: 0.5rem; cursor: pointer;
+            border: 1px solid transparent; background: transparent;
+            transition: background 120ms, border-color 120ms, color 120ms;
+        }
+        .btn-clear:hover { background: #f1f5f9; border-color: #e2e8f0; color: #334155; }
+        .btn-clear:active { transform: scale(0.97); }
+
+        /* Message entrance */
+        @keyframes slide-up {
+            from { opacity: 0; transform: translateY(8px); }
+            to   { opacity: 1; transform: translateY(0); }
+        }
+        .msg-anim { animation: slide-up 0.26s cubic-bezier(0.23, 1, 0.32, 1) both; }
+
+        /* Suggestion chips */
+        .chip {
+            display: inline-flex; align-items: center;
+            padding: 0.4rem 0.875rem; border-radius: 0.625rem;
+            border: 1.5px solid #bbf7d0; background: #f0fdf4;
+            font-size: 0.8125rem; font-weight: 500; color: #166534;
+            cursor: pointer; white-space: nowrap; user-select: none;
+            transition: all 120ms;
+        }
+        .chip:hover  { background: #dcfce7; border-color: #4ade80; transform: translateY(-1px); box-shadow: 0 2px 8px rgba(46,125,50,0.15); }
+        .chip:active { transform: scale(0.96); }
+
+        /* Live pulse */
+        @keyframes pulse { 0%,100%{opacity:1;transform:scale(1)} 50%{opacity:.5;transform:scale(.75)} }
+        .pulse-dot { animation: pulse 2s ease-in-out infinite; }
+
+        /* Weather FX */
+        #weather-overlay { transition: background 1s ease; }
+        .rain-drop {
+            position: absolute; width: 1.5px; height: 18px; top: -20px; border-radius: 99px;
+            background: linear-gradient(to bottom, transparent, rgba(147,197,253,0.75));
+            animation: rain-fall linear infinite;
+        }
+        @keyframes rain-fall { to { transform: translateY(110vh) skewX(-6deg); } }
+        .heat-wave {
+            position: absolute; inset: 0;
+            background: radial-gradient(ellipse at 50% 20%, rgba(236,91,19,0.14) 0%, transparent 65%);
+            animation: heat-pulse 3s ease-in-out infinite alternate;
+        }
+        @keyframes heat-pulse { from { opacity: .3; } to { opacity: .85; } }
+        .snowflake {
+            position: absolute; top: -12px; font-size: 12px;
+            color: rgba(186,230,253,0.9); pointer-events: none;
+            animation: snow-fall linear infinite;
+        }
+        @keyframes snow-fall { to { transform: translateY(110vh) rotate(360deg); } }
+        .frost-edge { position: absolute; inset: 0; box-shadow: inset 0 0 90px rgba(125,211,252,0.3); }
+
+        /* Focus rings — keyboard only */
+        :focus:not(:focus-visible) { outline: none; }
+        :focus-visible { outline: 2px solid #2e7d32; outline-offset: 2px; border-radius: 4px; }
+    </style>
 </head>
-<body>
-    <div class="app-container">
-        <header class="main-header">
-            <div class="logo">
-                <span class="icon">☁️</span>
-                <h1>WeatherSnap</h1>
-            </div>
-            <div class="status-indicator">
-                <span class="dot"></span> Online
-            </div>
-        </header>
+<body class="h-screen flex flex-col overflow-hidden">
 
-        <main class="chat-container" id="chat-container">
-            <div class="message bot-message">
-                <div class="avatar">🤖</div>
-                <div class="message-content">
-                    <p>Hello! I'm your WeatherSnap assistant. Ask me about the weather in any location!</p>
-                </div>
-            </div>
-        </main>
+    <!-- Weather FX overlay — never intercepts clicks -->
+    <div id="weather-overlay" class="fixed inset-0 z-50 pointer-events-none overflow-hidden"></div>
 
-        <footer class="input-area">
-            <form id="chat-form" class="chat-form">
-                <input type="text" id="user-input" placeholder="Type a location (e.g., Delhi, Mumbai)..." autocomplete="off" required>
-                <button type="submit" id="send-btn">
-                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                        <line x1="22" y1="2" x2="11" y2="13"></line>
-                        <polygon points="22 2 15 22 11 13 2 9 22 2"></polygon>
-                    </svg>
-                </button>
-            </form>
-        </footer>
+    <!-- ── Header ────────────────────────────────────────── -->
+    <header class="flex-shrink-0 bg-white border-b border-slate-200 h-14 px-4 md:px-6 flex items-center justify-between z-10 shadow-sm">
+        <div class="flex items-center gap-2.5">
+            <div class="w-8 h-8 bg-primary rounded-lg flex items-center justify-center text-white shadow-sm">
+                <span class="material-symbols-outlined fill-1 text-[18px]">potted_plant</span>
+            </div>
+            <span class="font-bold text-slate-800 text-base">Niruthi Bot</span>
+            <span class="hidden sm:block text-xs text-slate-400 font-normal">Farm Intelligence</span>
+            <!-- Live indicator -->
+            <div class="flex items-center gap-1.5 px-2 py-0.5 bg-emerald-50 border border-emerald-200 rounded-full ml-1">
+                <div class="w-1.5 h-1.5 bg-emerald-500 rounded-full pulse-dot"></div>
+                <span class="text-[10px] font-bold text-emerald-700 uppercase tracking-wider">Live</span>
+            </div>
+        </div>
+
+        <button class="btn-clear" type="button" onclick="clearChat()" aria-label="Clear conversation">
+            <span class="material-symbols-outlined text-[16px]">delete_sweep</span>
+            <span class="hidden sm:inline">Clear</span>
+        </button>
+    </header>
+
+    <!-- ── Chat messages ─────────────────────────────────── -->
+    <div id="chat-scroll" class="flex-1 overflow-y-auto">
+        <div id="chat-container" class="max-w-2xl mx-auto px-4 py-8 space-y-5">
+            <!-- JS renders messages here -->
+        </div>
     </div>
+
+    <!-- ── Suggestion chips (hidden after first send) ─────── -->
+    <div id="suggestions" class="flex-shrink-0 pb-1">
+        <div class="max-w-2xl mx-auto px-4">
+            <p class="text-xs text-slate-400 mb-2 font-medium">Try asking:</p>
+            <div class="flex gap-2 flex-wrap">
+                <button class="chip" onclick="prefill('Pest risk for paddy in Odisha')">🐛 Pest risk in Odisha</button>
+                <button class="chip" onclick="prefill('Rainfall forecast in Bhubaneswar tomorrow')">🌧 Rainfall tomorrow</button>
+                <button class="chip" onclick="prefill('Weather in Mayurbhanja next 5 days')">📅 5-day forecast</button>
+                <button class="chip" onclick="prefill('Is it too hot in Cuttack today?')">🌡 Heat check today</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- ── Input bar ─────────────────────────────────────── -->
+    <div class="flex-shrink-0 bg-white border-t border-slate-200 px-4 py-3 md:px-6 md:py-4">
+        <form id="chat-form" class="max-w-2xl mx-auto flex items-end gap-2">
+            <!-- Input box -->
+            <div class="flex-1 flex items-end bg-slate-50 border border-slate-200 rounded-2xl
+                        focus-within:border-primary focus-within:ring-2 focus-within:ring-primary/20
+                        transition-all duration-150">
+                <textarea
+                    id="user-input"
+                    placeholder="Ask about weather, pest risks, or crop conditions…"
+                    rows="1"
+                    aria-label="Message AgriBot"
+                ></textarea>
+            </div>
+            <!-- Send -->
+            <button id="send-btn" type="submit" aria-label="Send message">
+                <span class="material-symbols-outlined text-[20px]">send</span>
+            </button>
+        </form>
+        <p class="max-w-2xl mx-auto text-[10px] text-slate-400 mt-2 text-center leading-relaxed">
+            Powered by GFS satellite data &nbsp;·&nbsp;
+            <kbd class="px-1 py-0.5 bg-slate-100 border border-slate-200 border-b-[2px] rounded text-[9px] font-mono">Enter</kbd>
+            to send &nbsp;·&nbsp;
+            <kbd class="px-1 py-0.5 bg-slate-100 border border-slate-200 border-b-[2px] rounded text-[9px] font-mono">Shift+Enter</kbd>
+            for new line
+        </p>
+    </div>
+
+    <script>
+        // ── Auto-resize textarea ──────────────────────────
+        const ta = document.getElementById('user-input');
+        ta.addEventListener('input', () => {
+            ta.style.height = 'auto';
+            ta.style.height = Math.min(ta.scrollHeight, 140) + 'px';
+        });
+
+        // ── Suggestion chip prefill ───────────────────────
+        function prefill(text) {
+            ta.value = text;
+            ta.focus();
+            ta.dispatchEvent(new Event('input'));
+            hideSuggestions();
+        }
+
+        function hideSuggestions() {
+            const s = document.getElementById('suggestions');
+            if (s) { s.style.display = 'none'; }
+        }
+
+        document.getElementById('chat-form').addEventListener('submit', hideSuggestions, { once: true });
+
+        // ── Clear chat ────────────────────────────────────
+        function clearChat() {
+            document.getElementById('chat-container').innerHTML = '';
+            document.getElementById('suggestions').style.display = '';
+            const ov = document.getElementById('weather-overlay');
+            ov.innerHTML = '';
+            ov.style.background = '';
+            ov.className = 'fixed inset-0 z-50 pointer-events-none overflow-hidden';
+            // Re-show greeting via app.js global if available
+            if (typeof showGreeting === 'function') showGreeting();
+        }
+    </script>
+
     <script src="app.js"></script>
 </body>
 </html>

@@ -1,43 +1,183 @@
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 import httpx
 import os
-import re
+import asyncio
 import time as time_module
-from datetime import date, datetime, timezone
+import json
+from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict
+from pydantic import BaseModel
+from groq import Groq
+from dotenv import load_dotenv
+import re
+
+load_dotenv()
+
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+
+groq_client = Groq(api_key=GROQ_API_KEY)
+
+os.environ["LANGCHAIN_TRACING_V2"] = os.getenv("LANGCHAIN_TRACING_V2", "true")
+os.environ["LANGCHAIN_API_KEY"] = os.getenv("LANGSMITH_API_KEY")
+os.environ["LANGCHAIN_PROJECT"] = os.getenv("LANGSMITH_PROJECT", "agribot")
+os.environ["LANGCHAIN_ENDPOINT"] = os.getenv("LANGCHAIN_ENDPOINT", "https://api.smith.langchain.com")
+
+from langsmith import traceable
+
+SOLR_SEARCH_URL = os.getenv("SOLR_SEARCH_URL")
+SOLR_AUTH = os.getenv("SOLR_AUTH_TOKEN")
+
+GFS_INTERPOLATE_URL = os.getenv("GFS_INTERPOLATE_URL")
+GFS_HOURLY_URL = os.getenv("GFS_HOURLY_URL")
+GFS_INFESTATION_URL = os.getenv("GFS_INFESTATION_URL")
+
+intent_cache: Dict[str, Dict] = {}
 
 app = FastAPI(title="WeatherSnap ChatBot Backend")
 
-# ──────────────────────────────────────────────
-# Configuration  (use environment variables;
-# fall back to defaults only for local dev)
-# ──────────────────────────────────────────────
-SOLR_SEARCH_URL  = os.getenv("SOLR_SEARCH_URL",  "https://solr.apps.niruthi.com/solr/location_data/select")
-SOLR_AUTH        = os.getenv("SOLR_AUTH_TOKEN",   "Basic YXBpOk5pcnV0aGlAMjRVc2Vy")   # move to .env in production!
-GFS_INTERPOLATE_URL = os.getenv("GFS_INTERPOLATE_URL", "https://gfsapi.niruthiapptesting.com/interpolate")
-GFS_HOURLY_URL   = os.getenv("GFS_HOURLY_URL",    "https://gfsapi.niruthiapptesting.com/hrlydata")
+INTENT_SYSTEM_PROMPT = """
+You are an intent extraction engine for an agriculture chatbot.
+
+You must classify the query and extract slots.
+
+Return STRICT JSON:
+
+{
+ "intent": "weather | pest",
+ "location": string | null,
+ "metric": string | null,
+ "query_type": "single | hourly | range | conditional_rain | conditional_condition | pest_forecast",
+ "day_offset": number | null,
+ "range_days": number | null,
+ "hour_range": number | null,
+ "condition": string | null,
+ "is_pest": boolean,
+ "crop_slug": string | null,
+ "sowing_date": string | null,
+ "missing_slots": list
+}
+
+Rules:
+
+PEST QUERIES:
+If user asks about pests, insects, infestation, diseases, or attack:
+- intent = pest
+- is_pest = true
+- query_type = pest_forecast
+
+WEATHER QUERIES:
+If user asks about rain, temperature, humidity, wind, or forecast:
+- intent = weather
+- is_pest = false
+
+Date rules:
+- "today" -> day_offset=0
+- "tomorrow" -> day_offset=1
+
+If the user specifies a calendar date such as:
+- "23rd march 2026"
+- "march 23 2026"
+- "23/03/2026"
+
+Then:
+- convert it to ISO format YYYY-MM-DD
+- store it in target_date
+- day_offset = null
+
+Output:
+
+{
+ "location": "Vijayawada",
+ "metric": "Tavg",
+ "query_type": "single",
+ "target_date": "2026-03-23",
+ "day_offset": null
+}
+
+Example:
+
+User:
+what will be temperature in vijayawada on 23rd march 2026
+Crop rules:
+- extract crop name if mentioned.
+
+Sowing date rules:
+Convert dates to DD-MM-YYYY.
+
+Example:
+
+User:
+which pests will attack paddy if sown on 10 december 2025 in hyderabad
+
+Output:
+
+{
+ "intent": "weather | pest",
+ "location": string | null,
+ "metric": string | null,
+ "query_type": "single | hourly | range | conditional_rain | conditional_condition | pest_forecast",
+ "day_offset": number | null,
+ "target_date": string | null,
+ "range_days": number | null,
+ "hour_range": number | null,
+ "condition": string | null,
+ "is_pest": boolean,
+ "crop_slug": string | null,
+ "sowing_date": string | null,
+ "missing_slots": list
+}
+
+Return JSON only.
+"""
 
 # Production: restrict to your frontend origin
 ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*").split(",")
 
-# ──────────────────────────────────────────────
-# Request/Response logging middleware
-# ──────────────────────────────────────────────
-@app.middleware("http")
-async def log_requests(request: Request, call_next):
-    start = time_module.time()
-    try:
-        response = await call_next(request)
-        duration = round((time_module.time() - start) * 1000, 1)
-        return response
-    except Exception as exc:
-        duration = round((time_module.time() - start) * 1000, 1)
-        raise
+@traceable(name="intent_extraction")
+def extract_intent(query: str) -> Dict:
 
-# ──────────────────────────────────────────────
-# CORS
-# ──────────────────────────────────────────────
+    if query in intent_cache:
+        return intent_cache[query]
+
+    try:
+
+        completion = groq_client.chat.completions.create(
+            model="llama-3.1-8b-instant",
+            temperature=0,
+            max_tokens=200,
+            messages=[
+                {"role": "system", "content": INTENT_SYSTEM_PROMPT},
+                {"role": "user", "content": query}
+            ],
+            response_format={"type": "json_object"},
+            timeout=10
+        )
+
+        content = completion.choices[0].message.content
+        intent = json.loads(content)
+        
+        intent_cache[query] = intent
+
+        return intent
+
+    except Exception:
+
+        return {
+            "location": query,
+            "metric": "ALL",
+            "query_type": "single",
+            "day_offset": 0,
+            "target_date": None,
+            "range_days": None,
+            "hour_range": None,
+            "condition": None,
+            "is_pest": False,
+            "crop_slug": None,
+            "sowing_date": None,
+            "missing_slots": []
+        }
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
@@ -45,222 +185,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-# ──────────────────────────────────────────────
-# NLU helpers
-# ──────────────────────────────────────────────
-
-# Words to strip when isolating the *location* (does NOT include metric words
-# so that metric extraction happens independently and cleanly)
-LOCATION_STOP_WORDS = {
-    "what", "is", "today", "the", "weather", "forecast", "in", "at", "for",
-    "of", "how", "show", "me", "look", "like", "will", "be", "are", "tell",
-    "give", "get", "please", "current", "latest", "update", "about", "a", "an",
-}
-
-# Time qualifiers that should not bleed into the location string
-TIME_WORDS = {
-    "today", "tomorrow", "tonight", "yesterday", "now", "currently", "next", "this",
-    "week", "month", "year", "hour", "hours", "day", "days",
-    "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday",
-    "morning", "afternoon", "evening", "night", "midnight", "noon",
-    "jan", "feb", "mar", "apr", "may", "jun",
-    "jul", "aug", "sep", "oct", "nov", "dec",
-}
-
-TIME_INTENT_MAP = [
-    ("day after tomorrow",  2),
-    ("day before yesterday",-2),
-    ("next week",           7),
-    ("yesterday",          -1),
-    ("tomorrow",            1),
-    ("tonight",             0),
-    ("today",               0),
-    ("now",                 0),
-    ("currently",           0),
-    ("this week",           0),
-    ("next monday",         None), 
-    ("next tuesday",        None),
-    ("next wednesday",      None),
-    ("next thursday",       None),
-    ("next friday",         None),
-    ("next saturday",       None),
-    ("next sunday",         None),
-    ("monday",              None),
-    ("tuesday",             None),
-    ("wednesday",           None),
-    ("thursday",            None),
-    ("friday",              None),
-    ("saturday",            None),
-    ("sunday",              None),
-]
-
-WEEKDAY_NAMES = ["monday","tuesday","wednesday","thursday","friday","saturday","sunday"]
-
-MULTI_DAY_PATTERNS = [
-    (re.compile(r"(?:next|coming|in(?:\s+the)?)\s+(\d+)\s+days?"), "range"),
-    (re.compile(r"(?:next|coming)\s+(?:few|couple\s+of|some)\s+days?"),  "range_few"),
-    (re.compile(r"(?:this|next|coming)\s+week"),                          "range_week"),
-    (re.compile(r"\bwhen\s+(?:will|does|is|would)\s+it\s+rain\b"),       "conditional_rain"),
-    (re.compile(r"\bwhen\s+(?:will|is|does)\s+(?:there\s+be\s+)?rain\b"),"conditional_rain"),
-    (re.compile(r"\bwill\s+it\s+rain\b"),                                 "conditional_rain"),
-    (re.compile(r"\bwhen\s+will\s+it\s+be\s+(hot|cold|windy|humid|warm)\b"), "conditional_condition"),
-]
-
-def resolve_day_offset(phrase: str) -> int:
-    """Convert a weekday name to a day offset from today."""
-    from datetime import timedelta
-    target_name = phrase.replace("next ", "").strip()
-    target_idx  = WEEKDAY_NAMES.index(target_name)
-    today_idx   = datetime.now(timezone.utc).weekday()
-    delta = (target_idx - today_idx) % 7
-    if delta == 0:
-        delta = 7   
-    return delta
-
-METRIC_MAP = {
-    "maximum temperature": "Tmax",
-    "max temperature":     "Tmax",
-    "max temp":            "Tmax",
-    "minimum temperature": "Tmin",
-    "min temperature":     "Tmin",
-    "min temp":            "Tmin",
-    "average temperature": "Tavg",
-    "avg temperature":     "Tavg",
-    "avg temp":            "Tavg",
-    "wind speed":          "Wind_Speed",
-    "wind":                "Wind_Speed",
-    "rainfall":            "Rainfall",
-    "rain":                "Rainfall",
-    "humidity":            "RH",
-    "humid":               "RH",
-    "temperature":         "Tavg",  
-    "temp":                "Tavg",
-}
-
-METRIC_WORDS = {
-    "max", "min", "maximum", "minimum", "average", "avg",
-    "temperature", "temp", "rain", "rainfall", "humidity", "humid",
-    "wind", "speed",
-}
-
-
-def extract_intent(query: str) -> Dict:
-    """
-    Parse a free-text weather query and return:
-      - location    : cleaned place name
-      - metric      : one of the METRIC_MAP values, or "ALL"
-      - query_type  : "single" | "range" | "conditional_rain" | "conditional_condition"
-      - day_offset  : int (single-day queries only)
-      - target_date : ISO string (single-day queries only)
-      - range_days  : int (range queries — how many days to return)
-      - condition   : str (conditional queries — what to look for, e.g. "rain", "hot")
-    """
-    q = query.lower().strip()
-
-    from datetime import timedelta
-    ist_offset = timedelta(hours=5, minutes=30)
-    today_ist  = (datetime.now(timezone.utc) + ist_offset).date()
-
-    # ── 1. Extract metric ────────────────────────────────────────────────────
-    metric = None
-    for phrase, value in METRIC_MAP.items():
-        if phrase in q:
-            metric = value
-            break
-
-
-    # ── 2. Check for multi-day / conditional patterns FIRST ─────────────────
-    query_type = "single"
-    range_days = None
-    condition  = None
-
-    for pattern, ptype in MULTI_DAY_PATTERNS:
-        m = pattern.search(q)
-        if m:
-            query_type = ptype
-
-            if ptype == "range":
-                range_days = int(m.group(1))
-
-            elif ptype == "range_few":
-                range_days = 5   # "few days" → 5
-
-            elif ptype == "range_week":
-                range_days = 7
-
-            elif ptype == "conditional_rain":
-                query_type = "conditional_rain"
-                condition  = "rain"
-                metric     = "Rainfall"   # override metric to Rainfall
-
-            elif ptype == "conditional_condition":
-                query_type = "conditional_condition"
-                condition  = m.group(1)   # "hot", "cold", "windy", "humid", "warm"
-
-            break
-
-
-    day_offset  = 0
-    target_date = today_ist
-
-    for phrase, offset in TIME_INTENT_MAP:
-        if phrase in q:
-            if offset is None:
-                day_offset = resolve_day_offset(phrase)
-            else:
-                day_offset = offset
-            break
-
-    target_date = today_ist + timedelta(days=day_offset)
-
-    SPECIFIC_DAY_WORDS = {"tomorrow", "tonight", "today", "now", "yesterday",
-                          "monday","tuesday","wednesday","thursday","friday","saturday","sunday",
-                          "day after tomorrow"}
-    has_specific_day = any(word in q for word in SPECIFIC_DAY_WORDS)
-
-    if query_type == "conditional_rain" and has_specific_day and not range_days:
-        range_days = 1
-
-    # ── 4. Extract location ──────────────────────────────────────────────────
-    location = q
-
-    preposition_patterns = [
-        r"\bin\s+([a-z][a-z\s]+?)(?:\s+(?:today|tomorrow|tonight|yesterday|next|this|now|currently|in\s+next|day\s+after|day\s+before|when)|\?|$)",
-        r"\bat\s+([a-z][a-z\s]+?)(?:\s+(?:today|tomorrow|tonight|yesterday|next|this|now|currently)|\?|$)",
-        r"\bfor\s+([a-z][a-z\s]+?)(?:\s+(?:today|tomorrow|tonight|yesterday|next|this|now|currently)|\?|$)",
-        r"\bof\s+([a-z][a-z\s]+?)(?:\s+(?:today|tomorrow|tonight|yesterday|next|this|now|currently)|\?|$)",
-    ]
-    matched = False
-    for pattern in preposition_patterns:
-        m = re.search(pattern, q)
-        if m:
-            location = m.group(1).strip()
-            matched = True
-            break
-
-    if not matched:
-        combined_stop = LOCATION_STOP_WORDS | METRIC_WORDS | TIME_WORDS
-        words = q.split()
-        location_words = [w for w in words if w not in combined_stop]
-        location = " ".join(location_words).strip()
-
-    location_tokens = [w for w in location.split() if w not in TIME_WORDS]
-    location = re.sub(r"[^\w\s]", "", " ".join(location_tokens)).strip()
-
-    final_location = location or query.strip()
-    final_metric   = metric or "ALL"
-
-    return {
-        "location":    final_location,
-        "metric":      final_metric,
-        "query_type":  query_type,
-        "day_offset":  day_offset,
-        "target_date": str(target_date),
-        "range_days":  range_days,
-        "condition":   condition,
-    }
-
 
 def validate_location(location: str) -> None:
     """Raise 400 if the extracted location is clearly invalid."""
@@ -333,6 +257,16 @@ def resolve_best_coords(doc: dict):
 
 
 # ──────────────────────────────────────────────
+# Pydantic models
+# ──────────────────────────────────────────────
+
+class InfestationRequest(BaseModel):
+    sowing_date: Optional[str] = "10-01-2026"
+    crop_slug:   Optional[str] = "paddy"
+    state_name:  Optional[str] = "Odisha"
+
+
+# ──────────────────────────────────────────────
 # Routes
 # ──────────────────────────────────────────────
 
@@ -342,7 +276,7 @@ async def search_location(q: str = Query(..., min_length=2)):
     Accepts a natural-language query, extracts location + metric intent,
     and searches Solr for matching locations.
     """
-    intent = extract_intent(q)
+    intent = await asyncio.to_thread(extract_intent, q)
     extracted_q = intent["location"]
 
     validate_location(extracted_q)
@@ -350,8 +284,9 @@ async def search_location(q: str = Query(..., min_length=2)):
     cache_key = f"search:{extracted_q}"
     cached = cache_get(cache_key)
     if cached:
-        cached["intent"] = intent
-        return cached
+        result = cached.copy()
+        result["intent"] = intent
+        return result
 
     solr_q = (
         f'(village:"{extracted_q}" OR state:"{extracted_q}" OR district:"{extracted_q}")'
@@ -360,21 +295,16 @@ async def search_location(q: str = Query(..., min_length=2)):
     params = {"q": solr_q, "rows": 8, "wt": "json"}
     headers = {"Authorization": SOLR_AUTH}
 
-
     async with httpx.AsyncClient(timeout=10.0) as client:
         try:
             response = await client.get(SOLR_SEARCH_URL, params=params, headers=headers)
             response.raise_for_status()
             data = response.json()
 
-            num_results = data.get("response", {}).get("numFound", "?")
-
-            # ── Log ALL fields of first doc so we can see every coord field available ──
             if data.get("response", {}).get("docs"):
                 first_doc = data["response"]["docs"][0]
                 coord_fields = {k: v for k, v in first_doc.items() if 'lat' in k.lower() or 'lon' in k.lower() or 'long' in k.lower()}
 
-                # ── Inject best_coords into each doc so frontend always uses right lat/lon ──
                 for doc in data["response"]["docs"]:
                     doc["_best_lat"], doc["_best_lon"] = resolve_best_coords(doc)
 
@@ -433,7 +363,6 @@ def filter_by_date(records: list, target_date, day_offset: int, date_field: str 
         from datetime import date
         target_date = date.fromisoformat(target_date)
 
-
     if day_offset < 0:
         return []
 
@@ -478,17 +407,32 @@ async def get_daily_weather(
     lon:         float,
     days:        Optional[int] = Query(default=None, ge=1, le=16),
     target_date: Optional[str] = Query(default=None),
-    day_offset:  Optional[int] = Query(default=None),
+    day_offset:  Optional[str] = Query(default=None),  # ← str, not int
     query_type:  Optional[str] = Query(default="single"),
     range_days:  Optional[int] = Query(default=None, ge=1, le=16),
     condition:   Optional[str] = Query(default=None),
 ):
-    """
-    query_type=single            -> one specific day
-    query_type=range             -> range_days days from today
-    query_type=conditional_rain  -> days where Rainfall > 0
-    query_type=conditional_condition -> days matching hot/cold/windy/humid
-    """
+    # ── Sanitize inputs ──────────────────────────────────────────────
+    # 1. Parse day_offset safely — frontend may send "null" as a string
+    _day_offset: Optional[int] = None
+    if day_offset is not None and day_offset.strip() not in ("null", "none", "", "undefined"):
+        try:
+            _day_offset = int(day_offset)
+        except ValueError:
+            _day_offset = None
+    day_offset = _day_offset
+
+    # 2. Range/conditional queries never need day_offset or target_date
+    RANGE_TYPES = {"range", "range_few", "range_week", "conditional_rain", "conditional_condition"}
+    if query_type in RANGE_TYPES:
+        day_offset  = None
+        target_date = None
+
+    # 3. condition param is only meaningful for conditional_condition
+    if query_type != "conditional_condition":
+        condition = None
+
+    # ── rest of your existing code unchanged from here ───────────────
     cache_key = f"daily:{lat}:{lon}:{query_type}:{target_date}:{day_offset}:{days}:{range_days}:{condition}"
     cached = cache_get(cache_key)
     if cached:
@@ -502,8 +446,10 @@ async def get_daily_weather(
 
     if target_date:
         try:
-            resolved_date   = date_cls.fromisoformat(target_date)
+            resolved_date = date_cls.fromisoformat(target_date)
             resolved_offset = (resolved_date - today_ist).days
+            day_offset = resolved_offset   
+            print(day_offset)
         except ValueError:
             raise HTTPException(status_code=400, detail=f"Invalid date '{target_date}'. Use YYYY-MM-DD.")
     elif day_offset is not None:
@@ -584,6 +530,8 @@ async def get_daily_weather(
             if extra_msg:
                 data["_message"] = extra_msg
 
+            record_count = len(data.get("Forecast data", data.get(list(data.keys())[0], [])) if isinstance(data, dict) else data)
+
             cache_set(cache_key, data)
             return data
 
@@ -653,6 +601,92 @@ async def get_hourly_weather(
             raise HTTPException(status_code=exc.response.status_code, detail=f"Hourly API error: {exc}")
         except Exception as exc:
             raise HTTPException(status_code=500, detail=f"Internal server error: {exc}")
+
+
+# ──────────────────────────────────────────────
+# Pest / Infestation endpoint
+# ──────────────────────────────────────────────
+
+@app.post("/api/pest/infestation")
+async def get_pest_infestation(
+    body: InfestationRequest,
+    lat: float = Query(...),
+    lon: float = Query(...),
+    is_next_week: bool = Query(False),
+):
+    # 1. Validation check
+    missing_fields = [f for f in ["crop_slug", "sowing_date"] if not getattr(body, f)]
+    if missing_fields:
+        return {"status": "need_info", "missing_slots": missing_fields}
+
+    # ── Normalise sowing_date to DD-MM-YYYY ──────────────────────────
+    # LLM returns ISO (YYYY-MM-DD), but GFS infestation API needs DD-MM-YYYY
+    sowing_date = body.sowing_date
+    if sowing_date and re.match(r"^\d{4}-\d{2}-\d{2}$", sowing_date):
+        # YYYY-MM-DD → DD-MM-YYYY
+        y, m, d = sowing_date.split("-")
+        sowing_date = f"{d}-{m}-{y}"
+
+    # 2. Cache check
+    cache_key = f"pest:{lat}:{lon}:{is_next_week}:{sowing_date}:{body.crop_slug}:{body.state_name}"
+    if (cached := cache_get(cache_key)):
+        return cached
+
+    # 3. Data Fetch — use normalised sowing_date
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        response = await client.post(
+            GFS_INFESTATION_URL,
+            params={"lat": lat, "lon": lon, "is_next_week": str(is_next_week).lower()},
+            json={
+                "sowing_date": sowing_date,          # ← normalised
+                "crop_slug":   body.crop_slug,
+                "state_name":  body.state_name
+            }
+        )
+        response.raise_for_status()
+        data = response.json()
+
+    # 4. Processing Pipeline
+    # Only iterate over the data list ONCE
+    active_threats = []
+    clear_threats = []
+    week_key = "next_week" if is_next_week else "current_week"
+
+    if isinstance(data.get("data"), list):
+        for item in data["data"]:
+            pct = (item.get("chances_percentage") or {}).get(week_key) or 0
+            name = item.get("infestation_name", "Unknown")
+            
+            if pct > 0:
+                active_threats.append({
+                    "name": name,
+                    "probability": pct,
+                    "risk_level": _risk_label(pct),
+                    **item
+                })
+            else:
+                clear_threats.append(name)
+
+    # 5. Finalize and Cache
+    data.update({
+        "active_threats": sorted(active_threats, key=lambda x: x["probability"], reverse=True),
+        "clear_threats": clear_threats,
+        "summary": {"active_count": len(active_threats), "week": week_key}
+    })
+    
+    cache_set(cache_key, data)
+    return data
+
+
+def _risk_label(probability: float) -> str:
+    """Convert a probability percentage to a human-readable risk level."""
+    if probability >= 75:
+        return "High"
+    if probability >= 40:
+        return "Medium"
+    if probability > 0:
+        return "Low"
+    return "None"
 
 
 # ──────────────────────────────────────────────
