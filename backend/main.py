@@ -1,12 +1,14 @@
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Header
 from fastapi.middleware.cors import CORSMiddleware
 import httpx
 import os
 import asyncio
 import time as time_module
 import json
+import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Optional, Dict
+from typing import Optional, Dict, Any, List
+from enum import Enum
 from pydantic import BaseModel
 from groq import Groq
 from dotenv import load_dotenv
@@ -15,7 +17,6 @@ import re
 load_dotenv()
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-
 groq_client = Groq(api_key=GROQ_API_KEY)
 
 os.environ["LANGCHAIN_TRACING_V2"] = os.getenv("LANGCHAIN_TRACING_V2", "true")
@@ -25,473 +26,753 @@ os.environ["LANGCHAIN_ENDPOINT"] = os.getenv("LANGCHAIN_ENDPOINT", "https://api.
 
 from langsmith import traceable
 
-SOLR_SEARCH_URL = os.getenv("SOLR_SEARCH_URL")
-SOLR_AUTH = os.getenv("SOLR_AUTH_TOKEN")
-
+SOLR_SEARCH_URL     = os.getenv("SOLR_SEARCH_URL")
+SOLR_AUTH           = os.getenv("SOLR_AUTH_TOKEN")
 GFS_INTERPOLATE_URL = os.getenv("GFS_INTERPOLATE_URL")
-GFS_HOURLY_URL = os.getenv("GFS_HOURLY_URL")
+GFS_HOURLY_URL      = os.getenv("GFS_HOURLY_URL")
 GFS_INFESTATION_URL = os.getenv("GFS_INFESTATION_URL")
+ALLOWED_ORIGINS     = os.getenv("ALLOWED_ORIGINS", "*").split(",")
 
-intent_cache: Dict[str, Dict] = {}
+SESSION_TTL = 1800  # 30 min inactivity
 
-app = FastAPI(title="WeatherSnap ChatBot Backend")
 
-INTENT_SYSTEM_PROMPT = """
+class Step(str, Enum):
+    IDLE            = "idle"
+    COLLECTING      = "collecting"       # asking for missing slots
+    DISAMBIGUATING  = "disambiguating"   # multiple Solr results, pick one
+
+
+class SessionState:
+    def __init__(self, session_id: str):
+        self.session_id = session_id
+        self.step       = Step.IDLE
+
+        # ── Set by LLM intent on first message ──────────────────
+        self.intent_type  = None    # "weather" | "pest"
+        self.crop_slug    = None
+        self.metric       = "ALL"
+        self.query_type   = "single"
+        self.day_offset   = None
+        self.target_date  = None
+        self.range_days   = None
+        self.hour_range   = None
+        self.condition    = None
+        self.is_next_week = False
+
+        # ── Slots (filled progressively) ────────────────────────
+        self.location_str        = None   # raw string from user
+        self.resolved_location   = None   # Solr doc with coords
+        self.location_candidates = None   # list when ambiguous
+        self.sowing_date         = None   # normalised DD-MM-YYYY
+
+        # ── Which slots still need answers ──────────────────────
+        self.missing_slots: List[str] = []
+
+        self.history: List[Dict] = []
+        self.created_at  = time_module.time()
+        self.last_active = time_module.time()
+
+    def touch(self):
+        self.last_active = time_module.time()
+
+    def log(self, role: str, content: str):
+        self.history.append({"role": role, "content": content, "ts": time_module.time()})
+        if len(self.history) > 20:
+            self.history = self.history[-20:]
+
+    def debug(self):
+        return {
+            "session_id":        self.session_id,
+            "step":              self.step,
+            "intent_type":       self.intent_type,
+            "crop_slug":         self.crop_slug,
+            "location_str":      self.location_str,
+            "resolved_location": bool(self.resolved_location),
+            "sowing_date":       self.sowing_date,
+            "missing_slots":     self.missing_slots,
+        }
+
+
+_sessions: Dict[str, SessionState] = {}
+
+
+def get_session(sid: str) -> SessionState:
+    now = time_module.time()
+    stale = [k for k, v in _sessions.items() if now - v.last_active > SESSION_TTL]
+    for k in stale:
+        del _sessions[k]
+    if sid not in _sessions:
+        _sessions[sid] = SessionState(sid)
+    s = _sessions[sid]
+    s.touch()
+    return s
+
+
+# ══════════════════════════════════════════════════════════════
+# INTENT EXTRACTION  (LLM, first message only)
+# ══════════════════════════════════════════════════════════════
+
+_intent_cache: Dict[str, Dict] = {}
+
+INTENT_PROMPT = """
 You are an intent extraction engine for an agriculture chatbot.
-
-You must classify the query and extract slots.
-
-Return STRICT JSON:
+Extract slots from the user query and return STRICT JSON only.
 
 {
- "intent": "weather | pest",
- "location": string | null,
- "metric": string | null,
- "query_type": "single | hourly | range | conditional_rain | conditional_condition | pest_forecast",
- "day_offset": number | null,
- "range_days": number | null,
- "hour_range": number | null,
- "condition": string | null,
- "is_pest": boolean,
- "crop_slug": string | null,
- "sowing_date": string | null,
- "missing_slots": list
+  "intent": "weather | pest",
+  "is_pest": boolean,
+  "location": string | null,
+  "crop_slug": string | null,
+  "sowing_date": string | null,
+  "metric": "ALL | Tmax | Tmin | Tavg | Rainfall | RH | Wind_Speed",
+  "query_type": "single | hourly | range | range_week | conditional_rain | conditional_condition | pest_forecast",
+  "day_offset": number | null,
+  "target_date": "YYYY-MM-DD" | null,
+  "range_days": number | null,
+  "hour_range": number | null,
+  "condition": string | null
 }
 
 Rules:
+- pest queries (pests/insects/infestation/disease/attack): intent=pest, is_pest=true
+- weather queries (rain/temp/humidity/wind/forecast): intent=weather, is_pest=false
+- NO date/time mentioned → day_offset=0, query_type=single  ← ADD THIS
+- "today", "now", "current", "right now" → day_offset=0
+- "tomorrow" → day_offset=1
+- "this week", "next 7 days", "weekly" → query_type=range_week
+- "next few days", "forecast" → query_type=range, range_days=5
+- calendar dates → target_date YYYY-MM-DD, day_offset=null
+- sowing dates → DD-MM-YYYY format
+- crop name → crop_slug lowercase hyphenated e.g. "paddy", "sugar-cane"
+- temperature/temp → metric=Tavg (unless max/min specified)
+- max temp / high → metric=Tmax
+- min temp / low / cold → metric=Tmin
+- rain/rainfall → metric=Rainfall
+- humidity → metric=RH
+- wind → metric=Wind_Speed
+- multiple metrics or general weather → metric=ALL
 
-PEST QUERIES:
-If user asks about pests, insects, infestation, diseases, or attack:
-- intent = pest
-- is_pest = true
-- query_type = pest_forecast
-
-WEATHER QUERIES:
-If user asks about rain, temperature, humidity, wind, or forecast:
-- intent = weather
-- is_pest = false
-
-Date rules:
-- "today" -> day_offset=0
-- "tomorrow" -> day_offset=1
-
-If the user specifies a calendar date such as:
-- "23rd march 2026"
-- "march 23 2026"
-- "23/03/2026"
-
-Then:
-- convert it to ISO format YYYY-MM-DD
-- store it in target_date
-- day_offset = null
-
-Output:
-
-{
- "location": "Vijayawada",
- "metric": "Tavg",
- "query_type": "single",
- "target_date": "2026-03-23",
- "day_offset": null
-}
-
-Example:
-
-User:
-what will be temperature in vijayawada on 23rd march 2026
-Crop rules:
-- extract crop name if mentioned.
-
-Sowing date rules:
-Convert dates to DD-MM-YYYY.
-
-Example:
-
-User:
-which pests will attack paddy if sown on 10 december 2025 in hyderabad
-
-Output:
-
-{
- "intent": "weather | pest",
- "location": string | null,
- "metric": string | null,
- "query_type": "single | hourly | range | conditional_rain | conditional_condition | pest_forecast",
- "day_offset": number | null,
- "target_date": string | null,
- "range_days": number | null,
- "hour_range": number | null,
- "condition": string | null,
- "is_pest": boolean,
- "crop_slug": string | null,
- "sowing_date": string | null,
- "missing_slots": list
-}
-
-Return JSON only.
+Return JSON only. No explanation.
 """
 
-# Production: restrict to your frontend origin
-ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*").split(",")
 
 @traceable(name="intent_extraction")
 def extract_intent(query: str) -> Dict:
-
-    if query in intent_cache:
-        return intent_cache[query]
-
+    if query in _intent_cache:
+        return _intent_cache[query]
     try:
-
-        completion = groq_client.chat.completions.create(
+        r = groq_client.chat.completions.create(
             model="llama-3.1-8b-instant",
-            temperature=0,
-            max_tokens=200,
+            temperature=0, max_tokens=200,
             messages=[
-                {"role": "system", "content": INTENT_SYSTEM_PROMPT},
-                {"role": "user", "content": query}
+                {"role": "system", "content": INTENT_PROMPT},
+                {"role": "user",   "content": query},
             ],
             response_format={"type": "json_object"},
-            timeout=10
+            timeout=10,
         )
-
-        content = completion.choices[0].message.content
-        intent = json.loads(content)
-        
-        intent_cache[query] = intent
-
+        intent = json.loads(r.choices[0].message.content)
+        _intent_cache[query] = intent
         return intent
-
     except Exception:
-
         return {
-            "location": query,
-            "metric": "ALL",
-            "query_type": "single",
-            "day_offset": 0,
-            "target_date": None,
-            "range_days": None,
-            "hour_range": None,
-            "condition": None,
-            "is_pest": False,
-            "crop_slug": None,
-            "sowing_date": None,
-            "missing_slots": []
+            "intent": "weather", "is_pest": False,
+            "location": None, "crop_slug": None, "sowing_date": None,
+            "metric": "ALL", "query_type": "single",
+            "day_offset": 0, "target_date": None,
+            "range_days": None, "hour_range": None, "condition": None,
         }
+
+
+# ══════════════════════════════════════════════════════════════
+# SOLR  (location search + coord resolution)
+# ══════════════════════════════════════════════════════════════
+
+_cache:    Dict[str, Any]   = {}
+_cache_ts: Dict[str, float] = {}
+CACHE_TTL = 300
+
+
+def _cget(k):
+    if k in _cache and time_module.time() - _cache_ts[k] < CACHE_TTL:
+        return _cache[k]
+    return None
+
+
+def _cset(k, v):
+    _cache[k] = v
+    _cache_ts[k] = time_module.time()
+
+
+COORD_PRIORITY = [
+    ("village_latitude", "village_longitude"),
+    ("village_lat", "village_lon"),
+    ("mandal_latitude", "mandal_longitude"),
+    ("taluk_latitude", "taluk_longitude"),
+    ("subdistrict_latitude", "subdistrict_longitude"),
+    ("block_latitude", "block_longitude"),
+    ("district_latitude", "district_longitude"),
+    ("district_lat", "district_lon"),
+    ("state_latitude", "state_longitude"),
+    ("state_lat", "state_lon"),
+]
+
+
+def best_coords(doc: dict):
+    for lf, lo in COORD_PRIORITY:
+        lat = doc.get(lf)
+        lon = doc.get(lo)
+        if lat and lon:
+            lat = lat[0] if isinstance(lat, list) else lat
+            lon = lon[0] if isinstance(lon, list) else lon
+            if lat and lon:
+                return lat, lon
+    return None, None
+
+
+async def solr_search(q: str) -> List[Dict]:
+    key = f"solr:{q.lower().strip()}"
+    hit = _cget(key)
+    if hit is not None:
+        return hit
+    solr_q = (
+        f'(village:"{q}" OR state:"{q}" OR district:"{q}")'
+        f' OR (village:{q}~1 OR state:{q}~1 OR district:{q}~1)'
+    )
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        r = await client.get(
+            SOLR_SEARCH_URL,
+            params={"q": solr_q, "rows": 8, "wt": "json"},
+            headers={"Authorization": SOLR_AUTH},
+        )
+        r.raise_for_status()
+        docs = r.json().get("response", {}).get("docs", [])
+        for d in docs:
+            d["_best_lat"], d["_best_lon"] = best_coords(d)
+        _cset(key, docs)
+        return docs
+
+
+def _unwrap(val):
+    """Unwrap Solr array fields to a plain string."""
+    if isinstance(val, list):
+        return val[0] if val else None
+    return val
+
+
+# FIX - accept a fallback parameter
+def loc_label(doc: dict, fallback: str = "Unknown location") -> str:
+    if doc is None:
+        return fallback
+    name = _unwrap(doc.get("village")) or _unwrap(doc.get("district")) or _unwrap(doc.get("state"))
+    state = _unwrap(doc.get("state"))
+    parts = [name, state] if name != state else [name]
+    return ", ".join(p for p in parts if p)
+
+
+# ══════════════════════════════════════════════════════════════
+# SLOT VALIDATORS
+# ══════════════════════════════════════════════════════════════
+
+def valid_location_str(s: str) -> bool:
+    return bool(s) and len(s.strip()) >= 2 and not re.fullmatch(r"[\W\d\s]+", s.strip())
+
+
+def valid_sowing_date(s: str) -> bool:
+    return bool(
+        re.match(r"^\d{2}-\d{2}-\d{4}$", s)
+        or re.match(r"^\d{4}-\d{2}-\d{2}$", s)
+    )
+
+
+def normalise_date(s: str) -> str:
+    """YYYY-MM-DD → DD-MM-YYYY.  DD-MM-YYYY unchanged."""
+    if re.match(r"^\d{4}-\d{2}-\d{2}$", s):
+        y, m, d = s.split("-")
+        return f"{d}-{m}-{y}"
+    return s
+
+
+def extract_date(text: str) -> Optional[str]:
+    """Pull a date out of free text.  Returns DD-MM-YYYY or None."""
+    # DD-MM-YYYY or DD/MM/YYYY
+    m = re.search(r"\b(\d{1,2})[-/](\d{1,2})[-/](\d{4})\b", text)
+    if m:
+        return f"{m.group(1).zfill(2)}-{m.group(2).zfill(2)}-{m.group(3)}"
+    # YYYY-MM-DD
+    m = re.search(r"\b(\d{4})[-/](\d{2})[-/](\d{2})\b", text)
+    if m:
+        y, mo, d = m.group(1), m.group(2), m.group(3)
+        return f"{d}-{mo}-{y}"
+    # "10 december 2025" / "december 10 2025"
+    MONTHS = {
+        "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+        "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
+        "january": 1, "february": 2, "march": 3, "april": 4,
+        "june": 6, "july": 7, "august": 8, "september": 9,
+        "october": 10, "november": 11, "december": 12,
+    }
+    m = re.search(r"\b(\d{1,2})\s+([a-zA-Z]+)\s+(\d{4})\b", text)
+    if m and m.group(2).lower() in MONTHS:
+        return f"{m.group(1).zfill(2)}-{str(MONTHS[m.group(2).lower()]).zfill(2)}-{m.group(3)}"
+    m = re.search(r"\b([a-zA-Z]+)\s+(\d{1,2})\s+(\d{4})\b", text)
+    if m and m.group(1).lower() in MONTHS:
+        return f"{m.group(2).zfill(2)}-{str(MONTHS[m.group(1).lower()]).zfill(2)}-{m.group(3)}"
+    return None
+
+async def _fill_slots(s: SessionState, slots: Dict[str, str], sid: str) -> Dict:
+    """
+    Fill multiple slots at once from a structured dict.
+    Validates each value. Returns disambiguation or calls API when done.
+    """
+    errors: Dict[str, str] = {}
+
+    # Fill crop
+    if "crop" in slots:
+        crop_val = slots["crop"].strip().lower().replace(" ", "-")
+        if len(crop_val) >= 2:
+            s.crop_slug = crop_val
+            s.missing_slots = [m for m in s.missing_slots if m != "crop"]
+        else:
+            errors["crop"] = "Please enter a valid crop name (e.g. paddy, wheat, cotton)."
+
+    # Fill sowing_date
+    if "sowing_date" in slots:
+        extracted = extract_date(slots["sowing_date"])
+        if not extracted:
+            errors["sowing_date"] = (
+                "Please enter a valid sowing date in DD-MM-YYYY format (e.g. 10-12-2025)."
+            )
+        else:
+            s.sowing_date = normalise_date(extracted)
+            s.missing_slots = [m for m in s.missing_slots if m != "sowing_date"]
+
+    # Fill location (do this last — may trigger disambiguation)
+    if "location" in slots:
+        candidate = slots["location"].strip()
+        if not valid_location_str(candidate):
+            errors["location"] = "Please enter a valid location name (district or state)."
+        else:
+            try:
+                docs = await solr_search(candidate)
+            except Exception as e:
+                errors["location"] = f"Location lookup failed: {e}"
+                docs = []
+
+            if not docs:
+                errors["location"] = (
+                    f"<strong>{candidate}</strong> wasn't found. "
+                    "Please enter a valid district or state name."
+                )
+            elif len(docs) == 1:
+                s.resolved_location = docs[0]
+                s.location_str      = loc_label(s.resolved_location)
+                s.missing_slots     = [m for m in s.missing_slots if m != "location"]
+            else:
+                # Ambiguous — but crop/sowing already saved above ✅
+                s.location_candidates = docs
+                s.location_str        = candidate
+                s.missing_slots       = [m for m in s.missing_slots if m != "location"]
+                s.step = Step.DISAMBIGUATING
+                return {
+                    "type":       "ask_location_choice",
+                    "session_id": sid,
+                    "candidates": [
+                        {"index": i, "label": loc_label(d)}
+                        for i, d in enumerate(docs)
+                    ],
+                }
+
+    # Recompute missing
+    s.missing_slots = _missing(s)
+
+    if errors or s.missing_slots:
+        s.step = Step.COLLECTING
+        return _ask(s, sid, errors if errors else None)
+
+    return await _call_api(s, sid)
+
+# ══════════════════════════════════════════════════════════════
+# FASTAPI APP
+# ══════════════════════════════════════════════════════════════
+
+app = FastAPI(title="AgriBot Backend")
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
-    allow_headers=["*"],
+    allow_headers=["*", "X-Session-ID"],
+    expose_headers=["X-Session-ID"],
 )
 
-def validate_location(location: str) -> None:
-    """Raise 400 if the extracted location is clearly invalid."""
-    if not location or len(location) < 2:
-        raise HTTPException(
-            status_code=400,
-            detail="Could not extract a valid location from your query. "
-                   "Try: 'weather in Mumbai' or 'rainfall in Delhi'.",
-        )
-    if re.fullmatch(r"[\W\d\s]+", location):
-        raise HTTPException(
-            status_code=400,
-            detail=f"Extracted location '{location}' looks invalid. Please be more specific.",
-        )
+
+class ChatRequest(BaseModel):
+    message: str = ""
+    location_choice_index: Optional[int] = None
+    slots: Optional[Dict[str, str]] = None  # set when user picks a chip
 
 
-# ──────────────────────────────────────────────
-# Simple in-process TTL cache (no Redis needed)
-# ──────────────────────────────────────────────
-from typing import Any, Tuple
-
-_cache: Dict[str, Tuple[Any, float]] = {}
-CACHE_TTL_SECONDS = 300   # 5 minutes
-
-
-def cache_get(key: str) -> Optional[Any]:
-    entry = _cache.get(key)
-    if entry and (time_module.time() - entry[1]) < CACHE_TTL_SECONDS:
-        return entry[0]
-    return None
-
-
-def cache_set(key: str, value: Any) -> None:
-    _cache[key] = (value, time_module.time())
-
-
-# ──────────────────────────────────────────────
-# Coordinate resolver
-# ──────────────────────────────────────────────
-COORD_FIELD_PRIORITY = [
-    ("village_latitude",       "village_longitude"),
-    ("village_lat",            "village_lon"),
-    ("mandal_latitude",        "mandal_longitude"),
-    ("taluk_latitude",         "taluk_longitude"),
-    ("subdistrict_latitude",   "subdistrict_longitude"),
-    ("block_latitude",         "block_longitude"),
-    ("district_latitude",      "district_longitude"),
-    ("district_lat",           "district_lon"),
-    ("state_latitude",         "state_longitude"),
-    ("state_lat",              "state_lon"),
-]
-
-def resolve_best_coords(doc: dict):
-    """
-    Pick the most precise available lat/lon from a Solr doc.
-    Tries village → mandal → taluk → district → state.
-    Returns (lat, lon) or (None, None).
-    """
-    for lat_field, lon_field in COORD_FIELD_PRIORITY:
-        lat = doc.get(lat_field)
-        lon = doc.get(lon_field)
-        if lat and lon:
-            # Solr returns arrays — unwrap if needed
-            lat = lat[0] if isinstance(lat, list) else lat
-            lon = lon[0] if isinstance(lon, list) else lon
-            if lat and lon:
-                return lat, lon
-
-    return None, None
-
-
-# ──────────────────────────────────────────────
-# Pydantic models
-# ──────────────────────────────────────────────
-
-class InfestationRequest(BaseModel):
-    sowing_date: Optional[str] = "10-01-2026"
-    crop_slug:   Optional[str] = "paddy"
-    state_name:  Optional[str] = "Odisha"
-
-
-# ──────────────────────────────────────────────
-# Routes
-# ──────────────────────────────────────────────
-
-@app.get("/api/search")
-async def search_location(q: str = Query(..., min_length=2)):
-    """
-    Accepts a natural-language query, extracts location + metric intent,
-    and searches Solr for matching locations.
-    """
-    intent = await asyncio.to_thread(extract_intent, q)
-    extracted_q = intent["location"]
-
-    validate_location(extracted_q)
-
-    cache_key = f"search:{extracted_q}"
-    cached = cache_get(cache_key)
-    if cached:
-        result = cached.copy()
-        result["intent"] = intent
-        return result
-
-    solr_q = (
-        f'(village:"{extracted_q}" OR state:"{extracted_q}" OR district:"{extracted_q}")'
-        f' OR (village:{extracted_q}~1 OR state:{extracted_q}~1 OR district:{extracted_q}~1)'
-    )
-    params = {"q": solr_q, "rows": 8, "wt": "json"}
-    headers = {"Authorization": SOLR_AUTH}
-
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        try:
-            response = await client.get(SOLR_SEARCH_URL, params=params, headers=headers)
-            response.raise_for_status()
-            data = response.json()
-
-            if data.get("response", {}).get("docs"):
-                first_doc = data["response"]["docs"][0]
-                coord_fields = {k: v for k, v in first_doc.items() if 'lat' in k.lower() or 'lon' in k.lower() or 'long' in k.lower()}
-
-                for doc in data["response"]["docs"]:
-                    doc["_best_lat"], doc["_best_lon"] = resolve_best_coords(doc)
-
-            if "response" in data:
-                data["intent"] = intent
-
-            cache_set(cache_key, data)
-            return data
-
-        except httpx.TimeoutException:
-            raise HTTPException(status_code=504, detail="Location search timed out. Please try again.")
-        except httpx.HTTPStatusError as exc:
-            raise HTTPException(status_code=exc.response.status_code, detail=f"Search API error: {exc}")
-        except Exception as exc:
-            raise HTTPException(status_code=500, detail=f"Internal server error: {exc}")
-
-
-@app.get("/api/debug/location")
-async def debug_location(q: str = Query(...)):
-    """
-    Debug endpoint — returns the raw full Solr doc for a location query
-    so you can inspect every field and coordinate available.
-    Usage: GET /api/debug/location?q=mumbai
-    """
-    solr_q = (
-        f'(village:"{q}" OR state:"{q}" OR district:"{q}")'
-        f' OR (village:{q}~1 OR state:{q}~1 OR district:{q}~1)'
-    )
-    params = {"q": solr_q, "rows": 3, "wt": "json"}
-    headers = {"Authorization": SOLR_AUTH}
-
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        response = await client.get(SOLR_SEARCH_URL, params=params, headers=headers)
-        response.raise_for_status()
-        data = response.json()
-        docs = data.get("response", {}).get("docs", [])
-
-        # Annotate each doc with resolved coords
-        for doc in docs:
-            doc["_best_lat"], doc["_best_lon"] = resolve_best_coords(doc)
-            doc["_all_coord_fields"] = {k: v for k, v in doc.items() if 'lat' in k.lower() or 'lon' in k.lower() or 'long' in k.lower()}
-
-        return {"query": q, "numFound": data["response"]["numFound"], "docs": docs}
-
-
-def filter_by_date(records: list, target_date, day_offset: int, date_field: str = "Date_time") -> list:
-    """
-    Filter forecast records to match the requested day.
-    - day_offset == 0  → return today's record only
-    - day_offset > 0   → return the specific future date's record
-    - day_offset < 0   → past date requested; GFS only has today+future,
-                         so return empty list with a warning
-    """
-    from datetime import date as date_type
-    if isinstance(target_date, str):
-        from datetime import date
-        target_date = date.fromisoformat(target_date)
-
-    if day_offset < 0:
-        return []
-
-    matched, available = [], []
-    for record in records:
-        raw = record.get(date_field, "")
-        try:
-            record_date = datetime.fromisoformat(raw).date()
-            available.append(str(record_date))
-            if record_date == target_date:
-                matched.append(record)
-        except (ValueError, TypeError):
-            pass
-
-    return matched
-
-
-def filter_from_today(records: list, date_field: str = "Date_time") -> list:
-    """Drop records before today — used when no specific date is requested."""
-    from datetime import timedelta
-    ist_offset  = timedelta(hours=5, minutes=30)
-    today_ist   = (datetime.now(timezone.utc) + ist_offset).date()
-
-    filtered, skipped = [], []
-    for record in records:
-        raw = record.get(date_field, "")
-        try:
-            record_date = datetime.fromisoformat(raw).date()
-            if record_date >= today_ist:
-                filtered.append(record)
-            else:
-                skipped.append(str(record_date))
-        except (ValueError, TypeError):
-            filtered.append(record)
-
-    return filtered
-
-
-@app.get("/api/weather/daily")
-async def get_daily_weather(
-    lat:         float,
-    lon:         float,
-    days:        Optional[int] = Query(default=None, ge=1, le=16),
-    target_date: Optional[str] = Query(default=None),
-    day_offset:  Optional[str] = Query(default=None),  # ← str, not int
-    query_type:  Optional[str] = Query(default="single"),
-    range_days:  Optional[int] = Query(default=None, ge=1, le=16),
-    condition:   Optional[str] = Query(default=None),
+@app.post("/api/chat")
+async def chat(
+    body: ChatRequest,
+    x_session_id: Optional[str] = Header(default=None, alias="X-Session-ID"),
 ):
-    # ── Sanitize inputs ──────────────────────────────────────────────
-    # 1. Parse day_offset safely — frontend may send "null" as a string
-    _day_offset: Optional[int] = None
-    if day_offset is not None and day_offset.strip() not in ("null", "none", "", "undefined"):
+    if not x_session_id:
+        x_session_id = str(uuid.uuid4())
+
+    s = get_session(x_session_id)
+    s.log("user", str(body.slots or body.message))
+
+    print(f"[CHAT] sid={x_session_id[:8]} step={s.step} "
+          f"missing={s.missing_slots} msg={body.message!r} "
+          f"slots={body.slots} choice={body.location_choice_index}")
+
+    # ── STRUCTURED SLOT FILL ──────────────────────────────────────
+    if body.slots:
+        return await _fill_slots(s, body.slots, x_session_id)
+
+    # ── DISAMBIGUATING ────────────────────────────────────────────
+    if s.step == Step.DISAMBIGUATING:
+        if body.location_choice_index is not None:
+            cands = s.location_candidates or []
+            if 0 <= body.location_choice_index < len(cands):
+                s.resolved_location   = cands[body.location_choice_index]
+                s.location_str        = loc_label(s.resolved_location)
+                s.location_candidates = None
+                s.missing_slots       = [m for m in s.missing_slots if m != "location"]
+                if s.missing_slots:
+                    s.step = Step.COLLECTING
+                    return _ask(s, x_session_id)
+                return await _call_api(s, x_session_id)
+        # User typed instead of clicking — treat as new location
+        s.missing_slots = ["location"] + [m for m in s.missing_slots if m != "location"]
+        s.step = Step.COLLECTING
+        return await _collect(s, body.message, x_session_id)
+
+    # ── COLLECTING ────────────────────────────────────────────────
+    if s.step == Step.COLLECTING:
+        return await _collect(s, body.message, x_session_id)
+
+    # ── IDLE  (fresh query) ───────────────────────────────────────
+    intent = await asyncio.to_thread(extract_intent, body.message)
+
+    # Load everything from LLM into session
+    s.intent_type  = "pest" if intent.get("is_pest") else "weather"
+    s.crop_slug    = intent.get("crop_slug")
+    s.metric       = intent.get("metric") or "ALL"
+    s.query_type   = intent.get("query_type") or "single"
+    s.day_offset   = intent.get("day_offset")
+    s.target_date  = intent.get("target_date")
+    s.range_days   = intent.get("range_days")
+    s.hour_range   = intent.get("hour_range")
+    s.condition    = intent.get("condition")
+    s.is_next_week = s.query_type == "range_week" or (s.day_offset or 0) >= 7
+
+    if (s.query_type == "single" and s.day_offset == None and not s.target_date) :
+        s.day_offset = 0 
+    # Reset location / sowing for this new query
+    s.resolved_location   = None
+    s.location_candidates = None
+
+    # Seed from LLM if already present in the query
+    raw_loc = intent.get("location")
+    s.location_str = str(raw_loc) if raw_loc and valid_location_str(str(raw_loc)) else None
+
+    raw_sd = intent.get("sowing_date")
+    s.sowing_date = normalise_date(str(raw_sd)) if raw_sd and valid_sowing_date(str(raw_sd)) else None
+
+    # Compute what's still missing
+    s.missing_slots = _missing(s)
+
+    print(f"[INTENT] type={s.intent_type} crop={s.crop_slug} "
+          f"loc={s.location_str} sd={s.sowing_date} missing={s.missing_slots}")
+
+    if not s.missing_slots:
+        # Location string is known — resolve coords and fire
+        return await _resolve_and_call(s, x_session_id)
+
+    s.step = Step.COLLECTING
+    return _ask(s, x_session_id)
+
+
+# ══════════════════════════════════════════════════════════════
+# STATE-MACHINE HELPERS
+# ══════════════════════════════════════════════════════════════
+
+def _missing(s: SessionState) -> List[str]:
+    out = []
+    if not s.location_str:
+        out.append("location")
+    if s.intent_type == "pest" and not s.crop_slug:
+        out.append("crop")
+    if s.intent_type == "pest" and not s.sowing_date:
+        out.append("sowing_date")
+    return out
+
+
+def _ask(s: SessionState, sid: str, errors: Dict[str, str] = None) -> Dict:
+    """
+    Build a response card asking for all currently missing slots at once.
+    errors = {"location": "...", "sowing_date": "..."} for inline field errors.
+    """
+    FIELD_META = {
+        "location":    {"label": "Location",    "hint": "e.g. Hyderabad, Guntur, Vijayawada"},
+        "crop":        {"label": "Crop",        "hint": "e.g. paddy, potato, blackgram"},
+        "sowing_date": {"label": "Sowing Date", "hint": "DD-MM-YYYY  e.g. 10-12-2025"},
+    }
+    fields = []
+    for slot in s.missing_slots:
+        f = {"slot": slot, **FIELD_META.get(slot, {"label": slot, "hint": ""})}
+        if errors and slot in errors:
+            f["error"] = errors[slot]
+        fields.append(f)
+
+    return {
+        "type":        "ask_slots",
+        "session_id":  sid,
+        "fields":      fields,
+        "intent_type": s.intent_type,
+        "crop_slug":   s.crop_slug,
+    }
+
+
+async def _collect(s: SessionState, message: str, sid: str) -> Dict:
+    """
+    User answered while we were COLLECTING.
+    Parse their message to fill each still-missing slot.
+    Re-ask any slot whose answer was invalid or not found.
+    """
+    errors: Dict[str, str] = {}
+
+    # Pass 1: fill non-location slots first so they are saved before disambiguation
+    for slot in list(s.missing_slots):
+        if slot == "crop":
+            crop_val = message.strip().lower().replace(" ", "-")
+            if len(crop_val) >= 2:
+                s.crop_slug = crop_val
+                s.missing_slots = [m for m in s.missing_slots if m != "crop"]
+            else:
+                errors["crop"] = "Please enter a valid crop name (e.g. paddy, wheat, cotton)."
+
+        elif slot == "sowing_date":
+            extracted = extract_date(message)
+            if not extracted:
+                errors["sowing_date"] = (
+                    "Please enter a valid sowing date in DD-MM-YYYY format "
+                    "(e.g. 10-12-2025)."
+                )
+            else:
+                s.sowing_date   = normalise_date(extracted)
+                s.missing_slots = [m for m in s.missing_slots if m != "sowing_date"]
+
+    # Pass 2: resolve location (may return early for disambiguation)
+    if "location" in s.missing_slots:
+        candidate = message.strip()
+        if not valid_location_str(candidate):
+            errors["location"] = "Please enter a valid location name (district or state)."
+        else:
+            try:
+                docs = await solr_search(candidate)
+            except Exception as e:
+                errors["location"] = f"Location lookup failed: {e}"
+                docs = []
+
+            if not docs:
+                errors["location"] = (
+                    f"<strong>{candidate}</strong> wasn't found. "
+                    "Please enter a valid district or state name."
+                )
+            elif len(docs) == 1:
+                s.resolved_location = docs[0]
+                s.location_str      = loc_label(s.resolved_location)
+                s.missing_slots     = [m for m in s.missing_slots if m != "location"]
+            else:
+                # Ambiguous — sowing_date already saved above
+                s.location_candidates = docs
+                s.location_str        = candidate
+                s.missing_slots       = [m for m in s.missing_slots if m != "location"]
+                s.step = Step.DISAMBIGUATING
+                return {
+                    "type":       "ask_location_choice",
+                    "session_id": sid,
+                    "candidates": [
+                        {"index": i, "label": loc_label(d)}
+                        for i, d in enumerate(docs)
+                    ],
+                }
+
+    # Recompute (in case we missed something)
+    s.missing_slots = _missing(s)
+
+    if s.missing_slots or errors:
+        s.step = Step.COLLECTING
+        return _ask(s, sid, errors if errors else None)
+
+    # All done
+    return await _call_api(s, sid)
+
+
+async def _resolve_and_call(s: SessionState, sid: str) -> Dict:
+    """
+    location_str is set but coords not yet resolved.
+    Search Solr, handle ambiguity, then call API.
+    """
+    try:
+        docs = await solr_search(s.location_str)
+    except Exception as e:
+        s.step = Step.IDLE
+        return _err(f"Location search failed: {e}", sid)
+
+    if not docs:
+        s.location_str  = None
+        s.missing_slots = _missing(s)
+        s.step = Step.COLLECTING
+        return _ask(
+            s, sid,
+            errors={"location": f"<strong>{s.location_str or 'That location'}</strong> wasn't found."}
+        )
+
+    if len(docs) == 1:
+        s.resolved_location = docs[0]
+        return await _call_api(s, sid)
+
+    s.location_candidates = docs
+    s.step = Step.DISAMBIGUATING
+    return {
+        "type":       "ask_location_choice",
+        "session_id": sid,
+        "candidates": [{"index": i, "label": loc_label(d)} for i, d in enumerate(docs)],
+    }
+
+
+# ══════════════════════════════════════════════════════════════
+# API CALLERS
+# ══════════════════════════════════════════════════════════════
+
+async def _call_api(s: SessionState, sid: str) -> Dict:
+    # If location string is known but Solr doc not yet fetched, resolve now.
+    # This happens when the LLM extracted the location on the first message
+    # but we went straight to COLLECTING for other missing slots.
+    if s.resolved_location is None and s.location_str:
         try:
-            _day_offset = int(day_offset)
-        except ValueError:
-            _day_offset = None
-    day_offset = _day_offset
+            docs = await solr_search(s.location_str)
+        except Exception as e:
+            s.step = Step.IDLE
+            return _err(f"Location search failed: {e}", sid)
 
-    # 2. Range/conditional queries never need day_offset or target_date
-    RANGE_TYPES = {"range", "range_few", "range_week", "conditional_rain", "conditional_condition"}
-    if query_type in RANGE_TYPES:
-        day_offset  = None
-        target_date = None
+        if not docs:
+            s.location_str  = None
+            s.missing_slots = ["location"]
+            s.step = Step.COLLECTING
+            return _ask(s, sid, errors={"location": f"Could not find the location. Please enter a valid district or state."})
 
-    # 3. condition param is only meaningful for conditional_condition
-    if query_type != "conditional_condition":
-        condition = None
+        if len(docs) == 1:
+            s.resolved_location = docs[0]
+        else:
+            s.location_candidates = docs
+            s.missing_slots       = ["location"]
+            s.step = Step.DISAMBIGUATING
+            return {
+                "type":       "ask_location_choice",
+                "session_id": sid,
+                "candidates": [{"index": i, "label": loc_label(d)} for i, d in enumerate(docs)],
+            }
 
-    # ── rest of your existing code unchanged from here ───────────────
-    cache_key = f"daily:{lat}:{lon}:{query_type}:{target_date}:{day_offset}:{days}:{range_days}:{condition}"
-    cached = cache_get(cache_key)
-    if cached:
-        return cached
+    if s.resolved_location is None:
+        s.missing_slots = ["location"]
+        s.step = Step.COLLECTING
+        return _ask(s, sid)
 
-    from datetime import timedelta, date as date_cls
-    ist_offset    = timedelta(hours=5, minutes=30)
-    today_ist     = (datetime.now(timezone.utc) + ist_offset).date()
-    resolved_date = None
-    resolved_offset = None
+    s.step = Step.IDLE   # ready for next query
+    label = loc_label(s.resolved_location, fallback=s.location_str or "Unknown location")
+    if s.intent_type == "pest":
+        return await _pest(s, sid, label)
+    return await _weather(s, sid, label)
 
-    if target_date:
+
+async def _weather(s: SessionState, sid: str, label: str) -> Dict:
+    lat = s.resolved_location.get("_best_lat")
+    lon = s.resolved_location.get("_best_lon")
+    if not lat or not lon:
+        return _err("Could not resolve coordinates.", sid)
+
+    try:
+        # Hourly?
+        hr = 0
         try:
-            resolved_date = date_cls.fromisoformat(target_date)
-            resolved_offset = (resolved_date - today_ist).days
-            day_offset = resolved_offset   
-            print(day_offset)
-        except ValueError:
-            raise HTTPException(status_code=400, detail=f"Invalid date '{target_date}'. Use YYYY-MM-DD.")
-    elif day_offset is not None:
-        resolved_offset = day_offset
-        resolved_date   = today_ist + timedelta(days=day_offset)
+            hr = int(s.hour_range or 0)
+        except (TypeError, ValueError):
+            pass
+        is_hourly = hr > 0 or s.query_type == "hourly"
 
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        try:
-            response = await client.get(GFS_INTERPOLATE_URL, params={"lat": lat, "lon": lon})
-            response.raise_for_status()
-            data = response.json()
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            if is_hourly:
+                r = await client.get(GFS_HOURLY_URL, params={"lat": lat, "lon": lon})
+                r.raise_for_status()
+                data = r.json()
+                ist_now = (datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)).replace(tzinfo=None)
 
-            def apply_filter(records: list):
-                """Returns (filtered_records, message_or_None)"""
+                def fh(records):
+                    out = []
+                    for rec in records:
+                        try:
+                            if datetime.fromisoformat(rec.get("Date_time","")) >= ist_now:
+                                out.append(rec)
+                        except Exception:
+                            out.append(rec)
+                    return out[:hr or 24]
 
-                # Range: next N days
-                if query_type in ("range", "range_few", "range_week"):
-                    n      = range_days or days or 7
-                    result = filter_from_today(records)[:n]
-                    return result, None
+                if isinstance(data, dict):
+                    fk = next((k for k in data if isinstance(data[k], list)), None)
+                    if fk:
+                        data[fk] = fh(data[fk])
+                else:
+                    data = fh(data)
+                return {"type": "weather_result", "session_id": sid,
+                        "location_label": label, "intent": _intent_dict(s),
+                        "is_hourly": True, "data": data}
 
-                # Conditional: when will it rain
-                if query_type == "conditional_rain":
-                    future = filter_from_today(records)
+            # Daily
+            from datetime import date as dc
+            ist_today = (datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)).date()
+            RANGE_T   = {"range","range_few","range_week","conditional_rain","conditional_condition"}
 
-                    if range_days == 1 and resolved_date is not None:
-                        future = [r for r in future
-                                  if datetime.fromisoformat(r.get("Date_time","")).date() == resolved_date]
-                    elif range_days:
-                        future = future[:range_days]
+            day_offset = None
+            if s.day_offset is not None:
+                try:
+                    day_offset = int(s.day_offset)
+                except (TypeError, ValueError):
+                    pass
 
-                    rainy_days = [r for r in future if (r.get("Rainfall") or 0) > 0]
-                    if not rainy_days:
-                        if range_days == 1 and resolved_date:
-                            return [], f"☀️ No rainfall expected in the forecast for {resolved_date.strftime('%A, %d %b')}."
-                        window_desc = f"next {range_days} days" if range_days else "forecast period"
-                        return [], f"☀️ No rainfall expected in the {window_desc}."
-                    return rainy_days, None
+            res_date   = None
+            res_offset = None
+            if s.query_type not in RANGE_T:
+                if s.target_date and str(s.target_date) not in ("null",""):
+                    res_date   = dc.fromisoformat(str(s.target_date))
+                    res_offset = (res_date - ist_today).days
+                    day_offset = res_offset
+                elif day_offset is not None:
+                    res_offset = day_offset
+                    res_date   = ist_today + timedelta(days=day_offset)
 
-                # Conditional: hot/cold/windy/humid
-                if query_type == "conditional_condition":
-                    future = filter_from_today(records)
+            r = await client.get(GFS_INTERPOLATE_URL, params={"lat": lat, "lon": lon})
+            r.raise_for_status()
+            data = r.json()
+
+            def from_today(recs):
+                return [rec for rec in recs if _rec_date(rec) >= ist_today]
+
+            def apply(recs):
+                qt = s.query_type
+                if qt in ("range","range_few","range_week"):
+                    return from_today(recs)[:(s.range_days or 7)], None
+                if qt == "conditional_rain":
+                    fut   = from_today(recs)[:(s.range_days or len(recs))]
+                    rainy = [rec for rec in fut if (rec.get("Rainfall") or 0) > 0]
+                    return (rainy, None) if rainy else ([], "☀️ No rainfall expected.")
+                if qt == "conditional_condition":
                     COND = {
                         "hot":   lambda r: r.get("Tmax", 0) > 38,
                         "warm":  lambda r: r.get("Tmax", 0) > 30,
@@ -499,202 +780,190 @@ async def get_daily_weather(
                         "windy": lambda r: r.get("Wind_Speed", 0) > 20,
                         "humid": lambda r: r.get("RH", 0) > 80,
                     }
-                    fn      = COND.get(condition or "", lambda r: True)
-                    matched = [r for r in future if fn(r)]
-                    if not matched:
-                        return [], f"No '{condition}' conditions expected in the forecast period."
-                    return matched, None
+                    fn = COND.get(s.condition or "", lambda r: True)
+                    matched = [rec for rec in from_today(recs) if fn(rec)]
+                    return (matched, None) if matched else ([], f"No '{s.condition}' conditions expected.")
+                if res_date is not None:
+                    if (res_offset or 0) < 0:
+                        return [], "GFS only provides forecasts from today onwards."
+                    return [rec for rec in recs if _rec_date(rec) == res_date], None
+                return from_today(recs), None
 
-                # Single day
-                if resolved_date is not None:
-                    if resolved_offset < 0:
-                        return [], f"No historical data for {resolved_date}. GFS only provides forecasts from today onwards."
-                    result = filter_by_date(records, resolved_date, resolved_offset)
-                    return result, None
-
-                # Default: all from today
-                result = filter_from_today(records)
-                if days:
-                    result = result[:days]
-                return result, None
-
-            extra_msg = None
+            msg = None
             if isinstance(data, dict):
-                fkey = next((k for k in data if isinstance(data[k], list)), None)
-                if fkey:
-                    data[fkey], extra_msg = apply_filter(data[fkey])
-            elif isinstance(data, list):
-                filtered, extra_msg = apply_filter(data)
-                data = {"Forecast data": filtered}
+                fk = next((k for k in data if isinstance(data[k], list)), None)
+                if fk:
+                    data[fk], msg = apply(data[fk])
+            else:
+                data, msg = apply(data)
+                data = {"Forecast data": data}
+            if msg:
+                data["_message"] = msg
 
-            if extra_msg:
-                data["_message"] = extra_msg
+            return {"type": "weather_result", "session_id": sid,
+                    "location_label": label, "intent": _intent_dict(s),
+                    "is_hourly": False, "data": data}
 
-            record_count = len(data.get("Forecast data", data.get(list(data.keys())[0], [])) if isinstance(data, dict) else data)
+    except httpx.TimeoutException:
+        return _err("Weather service timed out.", sid)
+    except Exception as e:
+        return _err(f"Weather fetch failed: {e}", sid)
 
-            cache_set(cache_key, data)
-            return data
 
-        except httpx.TimeoutException:
-            raise HTTPException(status_code=504, detail="Daily weather fetch timed out.")
-        except httpx.HTTPStatusError as exc:
-            raise HTTPException(status_code=exc.response.status_code, detail=f"GFS API error: {exc}")
-        except Exception as exc:
-            raise HTTPException(status_code=500, detail=f"Internal server error: {exc}")
+async def _pest(s: SessionState, sid: str, label: str) -> Dict:
+    lat = s.resolved_location.get("_best_lat")
+    lon = s.resolved_location.get("_best_lon")
+    if not lat or not lon:
+        return _err("Could not resolve coordinates.", sid)
+
+    state = s.resolved_location.get("state")
+    if isinstance(state, list):
+        state = state[0]
+
+    sowing = normalise_date(s.sowing_date)
+    crop   = s.crop_slug 
+    key    = f"pest:{lat}:{lon}:{s.is_next_week}:{sowing}:{crop}:{state}"
+
+    if (cached := _cget(key)):
+        return {"type": "pest_result", "session_id": sid,
+                "location_label": label, "state": state,
+                "is_next_week": s.is_next_week,
+                "intent": _intent_dict(s), "data": cached}
+
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            r = await client.post(
+                GFS_INFESTATION_URL,
+                params={"lat": lat, "lon": lon, "is_next_week": str(s.is_next_week).lower()},
+                json={"sowing_date": sowing, "crop_slug": crop, "state_name": state},
+            )
+            r.raise_for_status()
+            data = r.json()
+        _cset(key, data)
+        return {"type": "pest_result", "session_id": sid,
+                "location_label": label, "state": state,
+                "is_next_week": s.is_next_week,
+                "intent": _intent_dict(s), "data": data}
+    except httpx.TimeoutException:
+        return _err("Pest service timed out.", sid)
+    except Exception as e:
+        return _err(f"Pest fetch failed: {e}", sid)
+
+
+def _intent_dict(s: SessionState) -> Dict:
+    return {
+        "intent":      s.intent_type,
+        "is_pest":     s.intent_type == "pest",
+        "metric":      s.metric,
+        "query_type":  s.query_type,
+        "day_offset":  s.day_offset,
+        "target_date": s.target_date,
+        "range_days":  s.range_days,
+        "hour_range":  s.hour_range,
+        "condition":   s.condition,
+        "crop_slug":   s.crop_slug,
+        "sowing_date": s.sowing_date,
+    }
+
+
+def _err(message: str, sid: str) -> Dict:
+    return {"type": "error", "session_id": sid, "message": message}
+
+
+def _rec_date(r: dict):
+    from datetime import date
+    try:
+        return datetime.fromisoformat(r.get("Date_time", r.get("Date", ""))).date()
+    except Exception:
+        return datetime.min.date()
+
+
+# ══════════════════════════════════════════════════════════════
+# DEBUG / UTILITY ENDPOINTS
+# ══════════════════════════════════════════════════════════════
+
+@app.get("/api/session/{session_id}")
+async def inspect_session(session_id: str):
+    s = _sessions.get(session_id)
+    if not s:
+        raise HTTPException(404, "Session not found")
+    return s.debug()
+
+
+@app.delete("/api/session/{session_id}")
+async def reset_session_ep(session_id: str):
+    _sessions.pop(session_id, None)
+    return {"status": "cleared"}
+
+
+@app.get("/api/debug/location")
+async def debug_location(q: str = Query(...)):
+    docs = await solr_search(q)
+    return {"query": q, "count": len(docs), "docs": docs}
+
+
+@app.get("/health")
+async def health():
+    return {"status": "ok", "active_sessions": len(_sessions)}
+
+
+# ══════════════════════════════════════════════════════════════
+# LEGACY ENDPOINTS (old frontend still works)
+# ══════════════════════════════════════════════════════════════
+
+@app.get("/api/search")
+async def legacy_search(q: str = Query(..., min_length=2)):
+    intent = await asyncio.to_thread(extract_intent, q)
+    raw    = intent.get("location")
+    if not raw or not valid_location_str(str(raw)):
+        if intent.get("is_pest"):
+            return {"status": "need_info", "missing_slots": ["location"], "intent": intent,
+                    "response": {"docs": [], "numFound": 0, "start": 0}}
+        raise HTTPException(400, "Could not extract a location.")
+    docs = await solr_search(str(raw))
+    return {"response": {"docs": docs, "numFound": len(docs)}, "intent": intent}
+
+
+class InfestationRequest(BaseModel):
+    sowing_date: Optional[str] = "10-01-2026"
+    crop_slug:   Optional[str] = "paddy"
+    state_name:  Optional[str] = "Odisha"
+
+
+@app.post("/api/pest/infestation")
+async def legacy_pest(
+    body: InfestationRequest,
+    lat: float = Query(...), lon: float = Query(...),
+    is_next_week: bool = Query(False),
+):
+    sd = body.sowing_date
+    if sd and re.match(r"^\d{4}-\d{2}-\d{2}$", sd):
+        y, m, d = sd.split("-")
+        sd = f"{d}-{m}-{y}"
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        r = await client.post(
+            GFS_INFESTATION_URL,
+            params={"lat": lat, "lon": lon, "is_next_week": str(is_next_week).lower()},
+            json={"sowing_date": sd, "crop_slug": body.crop_slug, "state_name": body.state_name},
+        )
+        r.raise_for_status()
+        return r.json()
+
+
+@app.get("/api/weather/daily")
+async def legacy_daily(lat: float, lon: float):
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        r = await client.get(GFS_INTERPOLATE_URL, params={"lat": lat, "lon": lon})
+        r.raise_for_status()
+        return r.json()
 
 
 @app.get("/api/weather/hourly")
-async def get_hourly_weather(
-    lat: float,
-    lon: float,
-    hours: Optional[int] = Query(default=24, ge=1, le=240, description="Number of hours to return (default 24)"),
-):
-    """
-    Fetch hourly weather forecast.
-    - Strips records before the current hour (IST).
-    - Returns only the first `hours` entries (default 24).
-    """
-    cache_key = f"hourly:{lat}:{lon}:{hours}"
-    cached = cache_get(cache_key)
-    if cached:
-        return cached
-
-    params = {"lat": lat, "lon": lon}
-
+async def legacy_hourly(lat: float, lon: float, hours: int = Query(default=24, ge=1, le=240)):
     async with httpx.AsyncClient(timeout=15.0) as client:
-        try:
-            response = await client.get(GFS_HOURLY_URL, params=params)
-            response.raise_for_status()
-            data = response.json()
-
-            from datetime import timedelta
-            ist_offset = timedelta(hours=5, minutes=30)
-            now_ist = datetime.now(timezone.utc) + ist_offset
-
-            def filter_hourly(records: list) -> list:
-                filtered, skipped = [], []
-                for r in records:
-                    raw = r.get("Date_time", r.get("datetime", r.get("time", "")))
-                    try:
-                        dt = datetime.fromisoformat(raw)
-                        if dt >= now_ist.replace(tzinfo=None):
-                            filtered.append(r)
-                        else:
-                            skipped.append(raw)
-                    except (ValueError, TypeError):
-                        filtered.append(r)
-                return filtered
-
-            if isinstance(data, dict):
-                forecast_key = next((k for k in data if isinstance(data[k], list)), None)
-                if forecast_key:
-                    data[forecast_key] = filter_hourly(data[forecast_key])[:hours]
-            elif isinstance(data, list):
-                data = filter_hourly(data)[:hours]
-
-            cache_set(cache_key, data)
-            return data
-
-        except httpx.TimeoutException:
-            raise HTTPException(status_code=504, detail="Hourly weather fetch timed out.")
-        except httpx.HTTPStatusError as exc:
-            raise HTTPException(status_code=exc.response.status_code, detail=f"Hourly API error: {exc}")
-        except Exception as exc:
-            raise HTTPException(status_code=500, detail=f"Internal server error: {exc}")
-
-
-# ──────────────────────────────────────────────
-# Pest / Infestation endpoint
-# ──────────────────────────────────────────────
-
-@app.post("/api/pest/infestation")
-async def get_pest_infestation(
-    body: InfestationRequest,
-    lat: float = Query(...),
-    lon: float = Query(...),
-    is_next_week: bool = Query(False),
-):
-    # 1. Validation check
-    missing_fields = [f for f in ["crop_slug", "sowing_date"] if not getattr(body, f)]
-    if missing_fields:
-        return {"status": "need_info", "missing_slots": missing_fields}
-
-    # ── Normalise sowing_date to DD-MM-YYYY ──────────────────────────
-    # LLM returns ISO (YYYY-MM-DD), but GFS infestation API needs DD-MM-YYYY
-    sowing_date = body.sowing_date
-    if sowing_date and re.match(r"^\d{4}-\d{2}-\d{2}$", sowing_date):
-        # YYYY-MM-DD → DD-MM-YYYY
-        y, m, d = sowing_date.split("-")
-        sowing_date = f"{d}-{m}-{y}"
-
-    # 2. Cache check
-    cache_key = f"pest:{lat}:{lon}:{is_next_week}:{sowing_date}:{body.crop_slug}:{body.state_name}"
-    if (cached := cache_get(cache_key)):
-        return cached
-
-    # 3. Data Fetch — use normalised sowing_date
-    async with httpx.AsyncClient(timeout=20.0) as client:
-        response = await client.post(
-            GFS_INFESTATION_URL,
-            params={"lat": lat, "lon": lon, "is_next_week": str(is_next_week).lower()},
-            json={
-                "sowing_date": sowing_date,          # ← normalised
-                "crop_slug":   body.crop_slug,
-                "state_name":  body.state_name
-            }
-        )
-        response.raise_for_status()
-        data = response.json()
-
-    # 4. Processing Pipeline
-    # Only iterate over the data list ONCE
-    active_threats = []
-    clear_threats = []
-    week_key = "next_week" if is_next_week else "current_week"
-
-    if isinstance(data.get("data"), list):
-        for item in data["data"]:
-            pct = (item.get("chances_percentage") or {}).get(week_key) or 0
-            name = item.get("infestation_name", "Unknown")
-            
-            if pct > 0:
-                active_threats.append({
-                    "name": name,
-                    "probability": pct,
-                    "risk_level": _risk_label(pct),
-                    **item
-                })
-            else:
-                clear_threats.append(name)
-
-    # 5. Finalize and Cache
-    data.update({
-        "active_threats": sorted(active_threats, key=lambda x: x["probability"], reverse=True),
-        "clear_threats": clear_threats,
-        "summary": {"active_count": len(active_threats), "week": week_key}
-    })
-    
-    cache_set(cache_key, data)
-    return data
-
-
-def _risk_label(probability: float) -> str:
-    """Convert a probability percentage to a human-readable risk level."""
-    if probability >= 75:
-        return "High"
-    if probability >= 40:
-        return "Medium"
-    if probability > 0:
-        return "Low"
-    return "None"
-
-
-# ──────────────────────────────────────────────
-# Health check
-# ──────────────────────────────────────────────
-@app.get("/health")
-async def health():
-    return {"status": "ok"}
+        r = await client.get(GFS_HOURLY_URL, params={"lat": lat, "lon": lon})
+        r.raise_for_status()
+        return r.json()
 
 
 if __name__ == "__main__":
