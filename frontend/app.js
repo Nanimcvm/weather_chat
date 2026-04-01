@@ -699,8 +699,8 @@ function renderPestReport(data, state, isNextWeek, intent) {
 }
 
 function riskLabel(p) {
-    if (p >= 75) return 'High';
-    if (p >= 40) return 'Medium';
+    if (p >= 60) return 'High';
+    if (p >= 30) return 'Medium';
     if (p > 0)   return 'Low';
     return 'None';
 }
